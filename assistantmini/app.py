@@ -5573,7 +5573,7 @@ async def module_economy_command(
 
 @client.tree.command(
     name="help",
-    description="Show AssistantMini's commands."
+    description="Show AssistantMini's Help commands."
 )
 async def help_command(
     interaction: discord.Interaction
