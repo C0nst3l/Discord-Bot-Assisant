@@ -5683,7 +5683,7 @@ async def help_command(
 
 @client.tree.command(
     name="help-admin",
-    description="Show AssistantMini's ADMIN commands."
+    description="Show AssistantMini's ADMIN Help commands."
 )
 async def admin_help_command(
     interaction: discord.Interaction
