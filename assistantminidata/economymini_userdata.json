@@ -1,0 +1,42 @@
+{
+    "664446946932686868": {
+        "coins": 4690,
+        "last_daily": 1791732958.9746094,
+        "last_weekly": 1791641430.2138865,
+        "created_at": 1791652581.4776273,
+        "level": 0,
+        "level_exp": 15,
+        "job_work_date": "2026-10-11",
+        "job_shifts_worked": 2,
+        "job_work_job": "Teacher",
+        "job_last_shift_at": 1791759781.1469388,
+        "job_last_reviewed_work_day": "2026-10-10",
+        "job_missed_shift_warnings": 0,
+        "job": "Teacher",
+        "coins_banks": 3311,
+        "bank_interest_day": "2026-10-12"
+    },
+    "781239974233767956": {
+        "coins": 1000,
+        "last_daily": null,
+        "level": 0,
+        "level_exp": 0,
+        "coins_banks": 0,
+        "bank_interest_day": "2026-10-12"
+    },
+    "1120053609162346567": {
+        "coins": 1200,
+        "created_at": 1791661696.706777,
+        "job": "Waiter",
+        "level": 0,
+        "level_exp": 0,
+        "job_work_date": "2026-10-11",
+        "job_shifts_worked": 1,
+        "job_work_job": "Waiter",
+        "job_last_shift_at": 1791732189.6867845,
+        "job_last_reviewed_work_day": "2026-10-10",
+        "job_missed_shift_warnings": 0,
+        "coins_banks": 0,
+        "bank_interest_day": "2026-10-12"
+    }
+}
