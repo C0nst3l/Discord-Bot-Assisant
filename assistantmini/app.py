@@ -67,6 +67,49 @@ PRIVATE_ECONOMY_EMBED_COMMANDS = {
     "economy-job-quit",
     "economy-leaderboard",
 }
+MODULE_LABELS = {
+    "giveaways": "Giveaways",
+    "levelling": "Levelling",
+    "economy": "Economy",
+}
+MODULE_COMMANDS = {
+    "giveaways": {
+        "giveaway-create",
+        "giveaway-reroll",
+        "giveaway-role-entry",
+        "giveaway-role-entry-remove",
+        "giveaway-role-entry-list",
+    },
+    "levelling": {
+        "level",
+        "level-set",
+        "level-xp-add",
+        "level-xp-remove",
+        "level-channel-exclude",
+        "level-channel-exclude-remove",
+        "level-channel-exclude-list",
+    },
+    "economy": {
+        "economy-daily",
+        "economy-weekly",
+        "economy-wallet",
+        "economy-bank-deposit",
+        "economy-bank-withdraw",
+        "economy-bank",
+        "economy-coin-flip",
+        "economy-pay",
+        "economy-job-apply",
+        "economy-work-shift",
+        "economy-job-quit",
+        "economy-profile",
+        "economy-leaderboard",
+    },
+}
+COMMAND_MODULES = {
+    command_name: module_name
+    for module_name, command_names in MODULE_COMMANDS.items()
+    for command_name in command_names
+}
 
 # How often failed giveaway completions are retried.
 RETRY_DELAY = 30
@@ -208,7 +251,11 @@ def get_default_server_settings():
         "colour": 0xffffff,
         "streamer": None,
         "assistantmini_premium": False,
-        "giveaway_role_entries": {}
+        "giveaway_role_entries": {},
+        "modules": {
+            module_name: True
+            for module_name in MODULE_LABELS
+        }
     }
 
 
@@ -223,6 +270,17 @@ def get_server_settings(guild_id: int):
         )
 
     return server_settings[guild_id_str]
+
+
+def get_module_enabled(settings, module_name: str):
+    if "modules" not in settings:
+        return True
+    modules = settings["modules"]
+    if not isinstance(modules, dict):
+        return None
+
+    enabled = modules.get(module_name, True)
+    return enabled if isinstance(enabled, bool) else None
 
 
 def add_premium_footer(embed: discord.Embed, guild_id: int):
@@ -975,6 +1033,43 @@ def create_finished_embed(
 # BOT
 # ============================================================
 
+class AssistantMiniCommandTree(app_commands.CommandTree):
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ) -> bool:
+        command = interaction.command
+        if interaction.guild is None or command is None:
+            return True
+
+        module_name = COMMAND_MODULES.get(command.name)
+        if module_name is None:
+            return True
+
+        settings = get_server_settings(interaction.guild.id)
+        enabled = get_module_enabled(settings, module_name)
+        if enabled is None:
+            print(
+                f"[MODULES] Invalid {module_name} module settings for guild "
+                f"{interaction.guild.id}."
+            )
+            await interaction.response.send_message(
+                "This module's settings are invalid. Please contact a server administrator.",
+                ephemeral=True
+            )
+            return False
+
+        if not enabled:
+            await interaction.response.send_message(
+                f"The {MODULE_LABELS[module_name]} module is disabled in this server.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+
 class AssistantMini(discord.Client):
 
     def __init__(self):
@@ -982,7 +1077,7 @@ class AssistantMini(discord.Client):
             intents=intents
         )
 
-        self.tree = app_commands.CommandTree(
+        self.tree = AssistantMiniCommandTree(
             self
         )
 
@@ -2022,7 +2117,7 @@ async def on_entitlement_create(entitlement: discord.Entitlement):
 
 
 # ============================================================
-# GIVEAWAY CREATE
+# Module Giveaways
 # ============================================================
 
 @client.tree.command(
@@ -3083,7 +3178,7 @@ async def send_economy_embed(
     )
 
 # ============================================================
-# Daily Command
+# Module Economy
 # ============================================================
 
 
@@ -4785,7 +4880,7 @@ async def guild_level_command(interaction: discord.Interaction):
     add_premium_footer(embed, interaction.guild.id)
     await interaction.response.send_message(embed=embed)
 # ============================================================
-# Guild Level change Command
+# Module Levelling
 # ============================================================
 
 
@@ -5125,7 +5220,7 @@ async def level_channel_exclude_list_command(
 
 
 # ============================================================
-# Economy Profile Command
+# Module Economy
 # ============================================================
 
 
@@ -5280,6 +5375,198 @@ async def economy_leaderboard_command(
 
 
 # ============================================================
+# Module Management Commands
+# ============================================================
+
+async def send_module_embed(
+    interaction: discord.Interaction,
+    title: str,
+    description: str
+):
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        colour=discord.Colour(0xffffff)
+    )
+    if interaction.guild is not None:
+        add_premium_footer(embed, interaction.guild.id)
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+async def require_module_admin(
+    interaction: discord.Interaction
+) -> bool:
+    if (
+        interaction.guild is not None
+        and isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    ):
+        return True
+
+    await interaction.response.send_message(
+        "You need the Administrator permission to manage server modules.",
+        ephemeral=True
+    )
+    return False
+
+
+async def set_module_enabled(
+    interaction: discord.Interaction,
+    module_name: str,
+    enabled: bool
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = str(guild.id)
+    settings = get_server_settings(guild.id)
+    modules = settings.get("modules", {})
+    if not isinstance(modules, dict):
+        print(
+            f"[MODULES] Invalid module settings for guild {guild_id}."
+        )
+        await interaction.response.send_message(
+            "Module settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    current_state = modules.get(module_name, True)
+    if not isinstance(current_state, bool):
+        print(
+            f"[MODULES] Invalid {module_name} module state for guild "
+            f"{guild_id}."
+        )
+        await interaction.response.send_message(
+            "This module's settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    updated_settings = {
+        **settings,
+        "modules": {
+            **modules,
+            module_name: enabled,
+        },
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id: updated_settings,
+    }
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        await interaction.response.send_message(
+            "The module setting could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    server_settings[guild_id] = updated_settings
+    state_label = "enabled" if enabled else "disabled"
+    await send_module_embed(
+        interaction,
+        "Module setting updated",
+        f"The {MODULE_LABELS[module_name]} module is now {state_label}."
+    )
+
+
+@client.tree.command(
+    name="modules",
+    description="Show the module status for this server."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def modules_command(interaction: discord.Interaction):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    status_lines = []
+    for module_name, label in MODULE_LABELS.items():
+        enabled = get_module_enabled(settings, module_name)
+        if enabled is None:
+            print(
+                f"[MODULES] Invalid {module_name} module state for guild "
+                f"{guild.id}."
+            )
+            await interaction.response.send_message(
+                "Module settings are invalid. Please contact support.",
+                ephemeral=True
+            )
+            return
+        status = "Active" if enabled else "Disabled"
+        status_lines.append(f"**{label}:** {status}")
+
+    await send_module_embed(
+        interaction,
+        "Server Modules",
+        "\n".join(status_lines)
+    )
+
+
+@client.tree.command(
+    name="module-giveaways",
+    description="Enable or disable the Giveaways module."
+)
+@app_commands.describe(enabled="Whether the Giveaways module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_giveaways_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "giveaways", enabled)
+
+
+@client.tree.command(
+    name="module-levelling",
+    description="Enable or disable the Levelling module."
+)
+@app_commands.describe(enabled="Whether the Levelling module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_levelling_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "levelling", enabled)
+
+
+@client.tree.command(
+    name="module-economy",
+    description="Enable or disable the Economy module."
+)
+@app_commands.describe(enabled="Whether the Economy module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_economy_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "economy", enabled)
+
+
+# ============================================================
 # Help Command
 # ============================================================
 
@@ -5425,6 +5712,27 @@ async def admin_help_command(
     )
 
     embed.add_field(
+        name="/modules",
+        value="Show whether the Giveaways, Levelling, and Economy modules are active in this server.",
+        inline=False
+    )
+    embed.add_field(
+        name="/module-giveaways",
+        value="Enable or disable the Giveaways module. Administrators only.",
+        inline=False
+    )
+    embed.add_field(
+        name="/module-levelling",
+        value="Enable or disable the Levelling module. Administrators only.",
+        inline=False
+    )
+    embed.add_field(
+        name="/module-economy",
+        value="Enable or disable the Economy module. Administrators only.",
+        inline=False
+    )
+
+    embed.add_field(
         name="/giveaway-create",
         value=(
             "Create a giveaway.\n"
@@ -5457,7 +5765,7 @@ async def admin_help_command(
     )
 
     embed.add_field(
-        name="/giveaway-entry-role-list",
+        name="/giveaway-role-entry-list",
         value=(
             "List roles with additional giveaway entries. "
             "Administrators only.\n"
@@ -5523,7 +5831,23 @@ async def admin_help_command(
 # ===========================================================
 @client.event
 async def on_message(message: discord.Message):
+    leveling_enabled = True
     if message.guild is not None and not message.author.bot:
+        leveling_enabled = get_module_enabled(
+            get_server_settings(message.guild.id),
+            "levelling"
+        )
+        if leveling_enabled is None:
+            print(
+                f"[MODULES] Invalid levelling module settings for guild "
+                f"{message.guild.id}; message XP was not awarded."
+            )
+
+    if (
+        message.guild is not None
+        and not message.author.bot
+        and leveling_enabled is True
+    ):
         guild_id = str(message.guild.id)
         user_id = str(message.author.id)
         now = time.time()
@@ -5669,19 +5993,30 @@ async def on_app_command_error(
         f"[COMMAND ERROR] {error}"
     )
 
+    command_name = (
+        interaction.command.name
+        if interaction.command is not None
+        else ""
+    )
+    error_message = (
+        "An unexpected error occurred."
+        if command_name == "modules" or command_name.startswith("module-")
+        else "❌ An unexpected error occurred."
+    )
+
     try:
 
         if interaction.response.is_done():
 
             await interaction.followup.send(
-                "❌ An unexpected error occurred.",
+                error_message,
                 ephemeral=True
             )
 
         else:
 
             await interaction.response.send_message(
-                "❌ An unexpected error occurred.",
+                error_message,
                 ephemeral=True
             )
 
