@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -32,10 +33,12 @@ SETTINGS_FILE = Path("server_settings.json")
 GIVEAWAY_FILE = Path("active_giveaways.json")
 ECONOMY_USERDATA_FILE = Path("economymini_userdata.json")
 GUILD_LEVELING_USERDATA_FILE = Path("guildlevelling_userdata.json")
+MESSAGE_LOG_CACHE_FILE = Path("message_log_cache.sqlite3")
 
 MAX_FIELD_VALUE_LENGTH = 1024
 MAX_GIVEAWAY_DURATION = 30 * 24 * 60 * 60
 COMPLETED_GIVEAWAY_RETENTION = 48 * 60 * 60
+MESSAGE_LOG_CACHE_RETENTION = 48 * 60 * 60
 PREMIUM_SKU_NAME = "AssistantMini Premium"
 COIN_CRATE_SKU_NAME = "MiniEconomy $1M Coins Crate"
 COIN_CRATE_REWARD = 1_000_000
@@ -71,6 +74,7 @@ MODULE_LABELS = {
     "giveaways": "Giveaways",
     "levelling": "Levelling",
     "economy": "Economy",
+    "logging": "Logging",
 }
 MODULE_COMMANDS = {
     "giveaways": {
@@ -253,7 +257,7 @@ def get_default_server_settings():
         "assistantmini_premium": False,
         "giveaway_role_entries": {},
         "modules": {
-            module_name: True
+            module_name: module_name != "logging"
             for module_name in MODULE_LABELS
         }
     }
@@ -274,12 +278,15 @@ def get_server_settings(guild_id: int):
 
 def get_module_enabled(settings, module_name: str):
     if "modules" not in settings:
-        return True
+        return module_name != "logging"
     modules = settings["modules"]
     if not isinstance(modules, dict):
         return None
 
-    enabled = modules.get(module_name, True)
+    enabled = modules.get(
+        module_name,
+        module_name != "logging"
+    )
     return enabled if isinstance(enabled, bool) else None
 
 
@@ -1067,6 +1074,16 @@ class AssistantMiniCommandTree(app_commands.CommandTree):
             )
             return False
 
+        if module_name == "logging":
+            log_channel_id = settings.get("log_channel_id")
+            if not isinstance(log_channel_id, str) or not log_channel_id.isdigit():
+                await interaction.response.send_message(
+                    "Logging is not configured. An administrator must use "
+                    "/log-channel before logging can be used.",
+                    ephemeral=True
+                )
+                return False
+
         return True
 
 
@@ -1085,6 +1102,7 @@ class AssistantMini(discord.Client):
         self.premium_sync_task = None
         self.giveaway_cleanup_task = None
         self.bank_interest_task = None
+        self.message_snapshot_cleanup_task = None
 
     async def setup_hook(self):
         """
@@ -1095,6 +1113,16 @@ class AssistantMini(discord.Client):
         """
 
         prune_expired_giveaways()
+        try:
+            prune_expired_message_snapshots()
+        except sqlite3.Error as error:
+            print(
+                f"[LOGGING] Could not prune expired message snapshots: "
+                f"{error}"
+            )
+        self.message_snapshot_cleanup_task = asyncio.create_task(
+            self.cleanup_message_snapshots()
+        )
         self.giveaway_cleanup_task = asyncio.create_task(
             self.cleanup_giveaway_history()
         )
@@ -1144,6 +1172,17 @@ class AssistantMini(discord.Client):
         while not self.is_closed():
             await asyncio.sleep(60)
             prune_expired_giveaways()
+
+    async def cleanup_message_snapshots(self):
+        while not self.is_closed():
+            await asyncio.sleep(60)
+            try:
+                prune_expired_message_snapshots()
+            except sqlite3.Error as error:
+                print(
+                    f"[LOGGING] Could not prune expired message snapshots: "
+                    f"{error}"
+                )
 
     async def run_bank_interest_schedule(self):
         while not self.is_closed():
@@ -5453,13 +5492,34 @@ def save_module_state(
         )
         return "Module settings are invalid. Please contact support."
 
-    current_state = modules.get(module_name, True)
+    current_state = modules.get(
+        module_name,
+        module_name != "logging"
+    )
     if not isinstance(current_state, bool):
         print(
             f"[MODULES] Invalid {module_name} module state for guild "
             f"{guild_id_str}."
         )
         return "This module's settings are invalid. Please contact support."
+
+    if module_name == "logging" and enabled:
+        log_channel_id = settings.get("log_channel_id")
+        guild = client.get_guild(guild_id)
+        channel = (
+            guild.get_channel(int(log_channel_id))
+            if (
+                guild is not None
+                and isinstance(log_channel_id, str)
+                and log_channel_id.isdigit()
+            )
+            else None
+        )
+        if not isinstance(channel, discord.TextChannel):
+            return (
+                "Set a valid log channel first with /log-channel, then "
+                "enable the Logging module."
+            )
 
     updated_settings = {
         **settings,
@@ -5477,6 +5537,295 @@ def save_module_state(
 
     server_settings[guild_id_str] = updated_settings
     return None
+
+def save_logging_setting(
+    guild_id: int,
+    setting_name: str,
+    value
+) -> bool:
+    guild_id_str = str(guild_id)
+    settings = get_server_settings(guild_id)
+    if not isinstance(settings, dict):
+        print(f"[LOGGING] Invalid settings for guild {guild_id_str}.")
+        return False
+
+    updated_settings = {
+        **settings,
+        setting_name: value,
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return False
+
+    server_settings[guild_id_str] = updated_settings
+    return True
+
+
+def is_logging_excluded(settings, channel_id: int) -> bool | None:
+    excluded_channels = settings.get("log_excluded_channels", [])
+    if (
+        not isinstance(excluded_channels, list)
+        or any(
+            not isinstance(item, str) or not item.isdigit()
+            for item in excluded_channels
+        )
+    ):
+        return None
+    return str(channel_id) in excluded_channels
+
+
+message_log_cache_connection = None
+
+
+def get_message_log_cache_connection():
+    global message_log_cache_connection
+
+    if message_log_cache_connection is None:
+        message_log_cache_connection = sqlite3.connect(
+            MESSAGE_LOG_CACHE_FILE
+        )
+        message_log_cache_connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_snapshots (
+                guild_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                attachments TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, message_id)
+            )
+            """
+        )
+        message_log_cache_connection.execute(
+            "CREATE INDEX IF NOT EXISTS message_snapshots_expiry "
+            "ON message_snapshots (expires_at)"
+        )
+        message_log_cache_connection.commit()
+
+    return message_log_cache_connection
+
+
+def create_message_snapshot(message: discord.Message) -> dict:
+    return {
+        "channel_id": str(message.channel.id),
+        "author_id": str(message.author.id),
+        "author_name": str(message.author),
+        "content": message.content,
+        "attachments": [
+            {
+                "filename": attachment.filename,
+                "url": attachment.url,
+            }
+            for attachment in message.attachments
+        ],
+    }
+
+
+def prune_expired_message_snapshots() -> None:
+    connection = get_message_log_cache_connection()
+    connection.execute(
+        "DELETE FROM message_snapshots WHERE expires_at <= ?",
+        (time.time(),)
+    )
+    connection.commit()
+
+
+def store_message_snapshot(
+    guild_id: int,
+    message_id: int,
+    snapshot: dict
+) -> None:
+    connection = get_message_log_cache_connection()
+    now = time.time()
+    connection.execute(
+        """
+        INSERT INTO message_snapshots (
+            guild_id, message_id, channel_id, author_id, author_name,
+            content, attachments, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (guild_id, message_id) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            author_id = excluded.author_id,
+            author_name = excluded.author_name,
+            content = excluded.content,
+            attachments = excluded.attachments,
+            expires_at = excluded.expires_at
+        """,
+        (
+            str(guild_id),
+            str(message_id),
+            snapshot["channel_id"],
+            snapshot["author_id"],
+            snapshot["author_name"],
+            snapshot["content"],
+            json.dumps(snapshot["attachments"], ensure_ascii=False),
+            now + MESSAGE_LOG_CACHE_RETENTION,
+        )
+    )
+    connection.commit()
+
+
+def get_message_snapshot(
+    guild_id: int,
+    message_id: int
+) -> dict | None:
+    connection = get_message_log_cache_connection()
+    prune_expired_message_snapshots()
+    row = connection.execute(
+        """
+        SELECT channel_id, author_id, author_name, content, attachments
+        FROM message_snapshots
+        WHERE guild_id = ? AND message_id = ?
+        """,
+        (str(guild_id), str(message_id))
+    ).fetchone()
+    connection.commit()
+    if row is None:
+        return None
+
+    try:
+        attachments = json.loads(row[4])
+    except json.JSONDecodeError as error:
+        print(
+            f"[LOGGING] Invalid cached attachments for message {message_id}: "
+            f"{error}"
+        )
+        return None
+
+    if not isinstance(attachments, list):
+        print(
+            f"[LOGGING] Invalid cached attachment data for message "
+            f"{message_id}."
+        )
+        return None
+
+    return {
+        "channel_id": row[0],
+        "author_id": row[1],
+        "author_name": row[2],
+        "content": row[3],
+        "attachments": attachments,
+    }
+
+
+def delete_message_snapshot(guild_id: int, message_id: int) -> None:
+    connection = get_message_log_cache_connection()
+    connection.execute(
+        "DELETE FROM message_snapshots WHERE guild_id = ? AND message_id = ?",
+        (str(guild_id), str(message_id))
+    )
+    connection.commit()
+
+
+async def send_message_log(
+    guild: discord.Guild,
+    embed: discord.Embed
+) -> bool:
+    settings = get_server_settings(guild.id)
+    log_channel_id = settings.get("log_channel_id")
+    if not isinstance(log_channel_id, str) or not log_channel_id.isdigit():
+        print(
+            f"[LOGGING] No valid log channel is configured for guild "
+            f"{guild.id}."
+        )
+        return False
+
+    channel = guild.get_channel(int(log_channel_id))
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(int(log_channel_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(
+                f"[LOGGING] Could not fetch log channel {log_channel_id} "
+                f"for guild {guild.id}: {error}"
+            )
+            return False
+
+    if not isinstance(channel, discord.TextChannel):
+        print(
+            f"[LOGGING] Configured log channel {log_channel_id} is not a "
+            f"text channel in guild {guild.id}."
+        )
+        return False
+
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.HTTPException as error:
+        print(
+            f"[LOGGING] Could not send a message log to channel "
+            f"{log_channel_id} in guild {guild.id}: {error}"
+        )
+        return False
+    return True
+
+
+def add_message_content_fields(
+    embed: discord.Embed,
+    title: str,
+    snapshot: dict
+) -> None:
+    content = snapshot["content"] or "(No text content.)"
+    for index, start in enumerate(range(0, len(content), 1024), start=1):
+        field_title = title if index == 1 else f"{title} (continued)"
+        embed.add_field(
+            name=field_title,
+            value=content[start:start + 1024],
+            inline=False
+        )
+
+    attachments = snapshot["attachments"]
+    if attachments:
+        attachment_text = "\n".join(
+            f"[{attachment['filename']}]({attachment['url']})"
+            for attachment in attachments
+            if (
+                isinstance(attachment, dict)
+                and isinstance(attachment.get("filename"), str)
+                and isinstance(attachment.get("url"), str)
+            )
+        )
+        if len(attachment_text) > 700:
+            attachment_text = attachment_text[:697] + "..."
+        if attachment_text:
+            embed.add_field(
+                name=f"{title} Attachments",
+                value=attachment_text,
+                inline=False
+            )
+
+
+def create_message_log_embed(
+    event_name: str,
+    guild_id: int,
+    message_id: int,
+    snapshot: dict,
+    after: dict | None = None
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Message {event_name}",
+        description=(
+            f"**Author:** {snapshot['author_name']} "
+            f"(`{snapshot['author_id']}`)\n"
+            f"**Channel:** <#{snapshot['channel_id']}>\n"
+            f"[Jump to message](https://discord.com/channels/{guild_id}/"
+            f"{snapshot['channel_id']}/{message_id})"
+        ),
+        colour=discord.Colour(0xffffff)
+    )
+    add_message_content_fields(embed, "Original Message", snapshot)
+    if after is not None:
+        add_message_content_fields(embed, "Updated Message", after)
+    add_premium_footer(embed, guild_id)
+    return embed
 
 
 class ModuleToggleButton(discord.ui.Button):
@@ -5706,6 +6055,176 @@ async def module_economy_command(
     await set_module_enabled(interaction, "economy", enabled)
 
 
+@client.tree.command(
+    name="module-logging",
+    description="Enable or disable the Logging module."
+)
+@app_commands.describe(enabled="Whether the Logging module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_logging_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "logging", enabled)
+
+
+@client.tree.command(
+    name="log-channel",
+    description="Set the channel where edited and deleted messages are logged."
+)
+@app_commands.describe(channel="The channel that will receive message logs.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_channel_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None or channel.guild.id != guild.id:
+        await interaction.response.send_message(
+            "Choose a text channel from this server.",
+            ephemeral=True
+        )
+        return
+
+    if not save_logging_setting(guild.id, "log_channel_id", str(channel.id)):
+        await interaction.response.send_message(
+            "The log channel could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Message logs will be sent to {channel.mention}.",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="log-channel-exclude",
+    description="Exclude a channel from edited and deleted message logging."
+)
+@app_commands.describe(
+    channel="The channel that should not be checked for message changes."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_channel_exclude_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None or channel.guild.id != guild.id:
+        await interaction.response.send_message(
+            "Choose a text channel from this server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    excluded_channels = settings.get("log_excluded_channels", [])
+    if (
+        not isinstance(excluded_channels, list)
+        or any(
+            not isinstance(channel_id, str) or not channel_id.isdigit()
+            for channel_id in excluded_channels
+        )
+    ):
+        print(
+            f"[LOGGING] Invalid excluded channel list for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Saved excluded-channel settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    channel_id = str(channel.id)
+    if channel_id in excluded_channels:
+        await interaction.response.send_message(
+            f"{channel.mention} is already excluded from message logging.",
+            ephemeral=True
+        )
+        return
+
+    if not save_logging_setting(
+        guild.id,
+        "log_excluded_channels",
+        [*excluded_channels, channel_id]
+    ):
+        await interaction.response.send_message(
+            "The channel exclusion could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"{channel.mention} is now excluded from message logging.",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="log-channel-exclude-list",
+    description="Show channels excluded from edited and deleted message logging."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_channel_exclude_list_command(
+    interaction: discord.Interaction
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    excluded_channels = settings.get("log_excluded_channels", [])
+    if (
+        not isinstance(excluded_channels, list)
+        or any(
+            not isinstance(channel_id, str) or not channel_id.isdigit()
+            for channel_id in excluded_channels
+        )
+    ):
+        print(
+            f"[LOGGING] Invalid excluded channel list for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Saved excluded-channel settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    channel_list = (
+        "\n".join(f"<#{channel_id}>" for channel_id in excluded_channels)
+        if excluded_channels
+        else "No channels are excluded."
+    )
+    embed = create_module_embed(
+        "Logging Channel Exclusions",
+        channel_list,
+        guild.id
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
 # ============================================================
 # Help Command
 # ============================================================
@@ -5871,6 +6390,26 @@ async def admin_help_command(
         value="Alternative command to enable or disable the Economy module.",
         inline=False
     )
+    embed.add_field(
+        name="/module-logging",
+        value="Enable or disable the Logging module. Set a log destination with /log-channel first.",
+        inline=False
+    )
+    embed.add_field(
+        name="/log-channel",
+        value="Choose the channel for edited and deleted message logs. Administrators only.",
+        inline=False
+    )
+    embed.add_field(
+        name="/log-channel-exclude",
+        value="Exclude a channel from edited and deleted message logging. Administrators only.",
+        inline=False
+    )
+    embed.add_field(
+        name="/log-channel-exclude-list",
+        value="Show channels excluded from message logging. Administrators only.",
+        inline=False
+    )
 
     embed.add_field(
         name="/giveaway-create",
@@ -5970,7 +6509,237 @@ async def admin_help_command(
 # Pre Made Rules Chat Command
 # ===========================================================
 @client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    if payload.guild_id is None:
+        return
+
+    guild = client.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    settings = get_server_settings(guild.id)
+    enabled = get_module_enabled(settings, "logging")
+    if enabled is None:
+        print(
+            f"[LOGGING] Invalid module settings for guild {guild.id}; "
+            "message edit was not logged."
+        )
+        return
+    if not enabled:
+        return
+
+    excluded = is_logging_excluded(settings, payload.channel_id)
+    if excluded is None:
+        print(
+            f"[LOGGING] Invalid excluded channel list for guild {guild.id}; "
+            "message edit was not logged."
+        )
+        return
+    if excluded:
+        return
+
+    try:
+        original = get_message_snapshot(guild.id, payload.message_id)
+    except sqlite3.Error as error:
+        print(
+            f"[LOGGING] Could not read snapshot for edited message "
+            f"{payload.message_id}: {error}"
+        )
+        original = None
+
+    cached_message = payload.cached_message
+    if original is None and cached_message is not None:
+        if cached_message.author.bot:
+            return
+        original = create_message_snapshot(cached_message)
+
+    raw_author = payload.data.get("author", {})
+    raw_author_id = (
+        raw_author.get("id")
+        if isinstance(raw_author, dict)
+        else None
+    )
+    raw_author_name = (
+        raw_author.get("username")
+        if isinstance(raw_author, dict)
+        else None
+    )
+    if original is None:
+        original = {
+            "channel_id": str(payload.channel_id),
+            "author_id": str(raw_author_id or "Unavailable"),
+            "author_name": raw_author_name or "Unavailable",
+            "content": "(No message snapshot was retained before this edit.)",
+            "attachments": [],
+        }
+
+    current_bot_id = (
+        str(client.user.id)
+        if client.user is not None
+        else None
+    )
+    if (
+        original["author_id"] == current_bot_id
+        or (
+            isinstance(raw_author_id, str)
+            and raw_author_id == current_bot_id
+        )
+    ):
+        return
+
+    updated = dict(original)
+    updated["channel_id"] = str(payload.channel_id)
+    content = payload.data.get("content")
+    if isinstance(content, str):
+        updated["content"] = content
+    raw_attachments = payload.data.get("attachments")
+    if isinstance(raw_attachments, list):
+        updated["attachments"] = [
+            {
+                "filename": item.get("filename", "Attachment"),
+                "url": item.get("url", ""),
+            }
+            for item in raw_attachments
+            if isinstance(item, dict)
+        ]
+
+    if isinstance(raw_author_id, str) and raw_author_id.isdigit():
+        updated["author_id"] = str(raw_author_id)
+    if isinstance(raw_author_name, str) and raw_author_name:
+        updated["author_name"] = raw_author_name
+
+    embed = create_message_log_embed(
+        "Edited",
+        guild.id,
+        payload.message_id,
+        original,
+        updated
+    )
+    await send_message_log(guild, embed)
+    try:
+        store_message_snapshot(guild.id, payload.message_id, updated)
+    except sqlite3.Error as error:
+        print(
+            f"[LOGGING] Could not save updated snapshot for message "
+            f"{payload.message_id}: {error}"
+        )
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.guild_id is None:
+        return
+
+    guild = client.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    settings = get_server_settings(guild.id)
+    enabled = get_module_enabled(settings, "logging")
+    if enabled is None:
+        print(
+            f"[LOGGING] Invalid module settings for guild {guild.id}; "
+            "message deletion was not logged."
+        )
+        return
+    if not enabled:
+        return
+
+    excluded = is_logging_excluded(settings, payload.channel_id)
+    if excluded is None:
+        print(
+            f"[LOGGING] Invalid excluded channel list for guild {guild.id}; "
+            "message deletion was not logged."
+        )
+        return
+    if excluded:
+        return
+
+    try:
+        snapshot = get_message_snapshot(guild.id, payload.message_id)
+    except sqlite3.Error as error:
+        print(
+            f"[LOGGING] Could not read snapshot for deleted message "
+            f"{payload.message_id}: {error}"
+        )
+        snapshot = None
+
+    message = payload.cached_message
+    if message is not None and message.author.bot:
+        return
+
+    if snapshot is None and message is not None:
+        snapshot = create_message_snapshot(message)
+
+    if snapshot is not None:
+        embed = create_message_log_embed(
+            "Deleted",
+            guild.id,
+            payload.message_id,
+            snapshot
+        )
+    else:
+        channel = guild.get_channel_or_thread(payload.channel_id)
+        channel_mention = (
+            channel.mention
+            if channel is not None
+            else f"<#{payload.channel_id}>"
+        )
+        embed = discord.Embed(
+            title="Message Deleted",
+            description=(
+                "**Author:** Unavailable (message was not cached)\n"
+                f"**Channel:** {channel_mention}\n"
+                f"**Message ID:** `{payload.message_id}`\n"
+                "Message content is unavailable because no 48-hour "
+                "snapshot was retained."
+            ),
+            colour=discord.Colour(0xffffff),
+            timestamp=discord.utils.utcnow()
+        )
+        add_premium_footer(embed, guild.id)
+
+    log_sent = await send_message_log(guild, embed)
+    if log_sent:
+        try:
+            delete_message_snapshot(guild.id, payload.message_id)
+        except sqlite3.Error as error:
+            print(
+                f"[LOGGING] Could not remove snapshot for deleted message "
+                f"{payload.message_id}: {error}"
+            )
+
+
+@client.event
 async def on_message(message: discord.Message):
+    if message.guild is not None and not message.author.bot:
+        settings = get_server_settings(message.guild.id)
+        logging_enabled = get_module_enabled(settings, "logging")
+        if logging_enabled is None:
+            print(
+                f"[LOGGING] Invalid module settings for guild "
+                f"{message.guild.id}; message snapshot was not saved."
+            )
+        elif logging_enabled:
+            excluded = is_logging_excluded(settings, message.channel.id)
+            if excluded is None:
+                print(
+                    f"[LOGGING] Invalid excluded channel list for guild "
+                    f"{message.guild.id}; message snapshot was not saved."
+                )
+            elif not excluded:
+                try:
+                    store_message_snapshot(
+                        message.guild.id,
+                        message.id,
+                        create_message_snapshot(message)
+                    )
+                except sqlite3.Error as error:
+                    print(
+                        f"[LOGGING] Could not save snapshot for message "
+                        f"{message.id}: {error}"
+                    )
+
     leveling_enabled = True
     if message.guild is not None and not message.author.bot:
         leveling_enabled = get_module_enabled(
