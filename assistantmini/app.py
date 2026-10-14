@@ -6718,6 +6718,111 @@ async def automod_log_channel_command(
 
 
 @client.tree.command(
+    name="purge",
+    description="Delete all or a chosen number of unpinned messages here."
+)
+@app_commands.describe(
+    message_count="How many unpinned messages to delete; omit to clear the channel."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def purge_command(
+    interaction: discord.Interaction,
+    message_count: int | None = None
+):
+    guild = interaction.guild
+    member = interaction.user
+    if (
+        guild is None
+        or not isinstance(member, discord.Member)
+        or not member.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to purge messages.",
+            ephemeral=True
+        )
+        return
+
+    if message_count is not None and message_count < 1:
+        await interaction.response.send_message(
+            "Message Count must be at least 1.",
+            ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "This command can only be used in a text channel or thread.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.response.send_message(
+            "I couldn't verify my permissions in this server. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.manage_messages or not permissions.read_message_history:
+        await interaction.response.send_message(
+            "I need Manage Messages and Read Message History permissions in "
+            "this channel to purge messages.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    selected_count = 0
+
+    def should_delete(message: discord.Message) -> bool:
+        nonlocal selected_count
+        if message.pinned:
+            return False
+        if message_count is not None and selected_count >= message_count:
+            return False
+        selected_count += 1
+        return True
+
+    try:
+        deleted_messages = await channel.purge(
+            limit=None,
+            check=should_delete,
+            reason=f"/purge command used by user {member.id}"
+        )
+    except discord.Forbidden as error:
+        print(
+            f"[PURGE] Missing permission while purging channel "
+            f"{channel.id} in guild {guild.id}: {error}"
+        )
+        await interaction.followup.send(
+            "I couldn't purge messages because Discord denied the request. "
+            "Check my channel permissions and try again.",
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as error:
+        print(
+            f"[PURGE] Discord API error while purging channel "
+            f"{channel.id} in guild {guild.id}: {error}"
+        )
+        await interaction.followup.send(
+            "Discord couldn't complete the purge. Some messages may have "
+            "been deleted; please check the channel.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"Deleted {len(deleted_messages)} unpinned message(s).",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
     name="log-channel",
     description="Set the channel where edited and deleted messages are logged."
 )
@@ -7056,8 +7161,10 @@ async def admin_help_command(
         inline=False
     )
     embed.add_field(
-        name="AutoMod commands",
+        name="Moderation and AutoMod commands",
         value=(
+            "/purge — Delete all unpinned messages in this channel, or "
+            "specify a message count. Administrators only.\n"
             "/module-automod — Enable or disable AutoMod.\n"
             "/automod-phrases-add — Add restricted words separated by "
             "commas, periods, slashes, or vertical bars.\n"
