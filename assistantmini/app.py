@@ -904,8 +904,6 @@ def get_giveaway_ticket_count(giveaway: dict):
 def create_giveaway_embed(giveaway: dict):
     guild_id = int(giveaway["guild_id"])
 
-    settings = get_server_settings(guild_id)
-
     colour = 0x44C2A1
 
     embed = discord.Embed(
@@ -5779,8 +5777,15 @@ async def notify_automod_owner_without_log_channel(
 
         owner = guild.owner
         if owner is None:
+            owner_id = guild.owner_id
+            if owner_id is None:
+                print(
+                    f"[AUTOMOD] Guild {guild.id} has no available owner ID; "
+                    "could not report the missing log channel."
+                )
+                return
             try:
-                owner = await client.fetch_user(guild.owner_id)
+                owner = await client.fetch_user(owner_id)
             except discord.HTTPException as error:
                 print(
                     f"[AUTOMOD] Could not find the owner of guild "
@@ -7592,7 +7597,7 @@ async def process_automod_message(message: discord.Message) -> bool:
         ),
         description=(
             f"**Member:** {message.author.mention} (`{message.author.id}`)\n"
-            f"**Channel:** {message.channel.mention}"
+            f"**Channel:** <#{message.channel.id}>"
         ),
         colour=discord.Colour.red()
     )
