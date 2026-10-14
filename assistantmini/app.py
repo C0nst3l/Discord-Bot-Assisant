@@ -5378,22 +5378,37 @@ async def economy_leaderboard_command(
 # Module Management Commands
 # ============================================================
 
-async def send_module_embed(
-    interaction: discord.Interaction,
+def create_module_embed(
     title: str,
-    description: str
-):
+    description: str,
+    guild_id: int | None = None
+) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=description,
         colour=discord.Colour(0xffffff)
     )
-    if interaction.guild is not None:
-        add_premium_footer(embed, interaction.guild.id)
+    if guild_id is not None:
+        add_premium_footer(embed, guild_id)
+    return embed
+
+
+async def send_module_embed(
+    interaction: discord.Interaction,
+    title: str,
+    description: str,
+    view: discord.ui.View | None = None
+):
+    embed = create_module_embed(
+        title,
+        description,
+        interaction.guild.id if interaction.guild is not None else None
+    )
 
     await interaction.response.send_message(
         embed=embed,
-        ephemeral=True
+        ephemeral=True,
+        view=view
     )
 
 
@@ -5414,6 +5429,167 @@ async def require_module_admin(
     return False
 
 
+def get_module_states(settings) -> dict[str, bool] | None:
+    states = {}
+    for module_name in MODULE_LABELS:
+        enabled = get_module_enabled(settings, module_name)
+        if enabled is None:
+            return None
+        states[module_name] = enabled
+    return states
+
+
+def save_module_state(
+    guild_id: int,
+    module_name: str,
+    enabled: bool
+) -> str | None:
+    guild_id_str = str(guild_id)
+    settings = get_server_settings(guild_id)
+    modules = settings.get("modules", {})
+    if not isinstance(modules, dict):
+        print(
+            f"[MODULES] Invalid module settings for guild {guild_id_str}."
+        )
+        return "Module settings are invalid. Please contact support."
+
+    current_state = modules.get(module_name, True)
+    if not isinstance(current_state, bool):
+        print(
+            f"[MODULES] Invalid {module_name} module state for guild "
+            f"{guild_id_str}."
+        )
+        return "This module's settings are invalid. Please contact support."
+
+    updated_settings = {
+        **settings,
+        "modules": {
+            **modules,
+            module_name: enabled,
+        },
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return "The module setting could not be saved. Please try again later."
+
+    server_settings[guild_id_str] = updated_settings
+    return None
+
+
+class ModuleToggleButton(discord.ui.Button):
+
+    def __init__(
+        self,
+        module_name: str,
+        enabled: bool
+    ):
+        self.module_name = module_name
+        self.module_label = MODULE_LABELS[module_name]
+        super().__init__(
+            label="",
+            style=discord.ButtonStyle.success
+        )
+        self.set_enabled(enabled)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.label = (
+            f"{self.module_label}: {'Active' if enabled else 'Disabled'}"
+        )
+        self.style = (
+            discord.ButtonStyle.success
+            if enabled
+            else discord.ButtonStyle.danger
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ) -> None:
+        if not isinstance(self.view, ModuleToggleView):
+            print("[MODULES] Module toggle button has no valid view.")
+            await interaction.response.send_message(
+                "This module control is unavailable. Please run /modules again.",
+                ephemeral=True
+            )
+            return
+
+        await self.view.toggle_module(interaction, self.module_name)
+
+
+class ModuleToggleView(discord.ui.View):
+
+    def __init__(self, states: dict[str, bool]):
+        super().__init__(timeout=15 * 60)
+        for module_name, enabled in states.items():
+            self.add_item(
+                ModuleToggleButton(module_name, enabled)
+            )
+
+    async def toggle_module(
+        self,
+        interaction: discord.Interaction,
+        module_name: str
+    ) -> None:
+        if not await require_module_admin(interaction):
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This control can only be used in a server.",
+                ephemeral=True
+            )
+            return
+
+        settings = get_server_settings(guild.id)
+        states = get_module_states(settings)
+        if states is None:
+            print(
+                f"[MODULES] Invalid module state for guild {guild.id}."
+            )
+            await interaction.response.send_message(
+                "Module settings are invalid. Please contact support.",
+                ephemeral=True
+            )
+            return
+
+        enabled = not states[module_name]
+        error = save_module_state(guild.id, module_name, enabled)
+        if error is not None:
+            await interaction.response.send_message(
+                error,
+                ephemeral=True
+            )
+            return
+
+        states[module_name] = enabled
+        for item in self.children:
+            if (
+                isinstance(item, ModuleToggleButton)
+                and item.module_name == module_name
+            ):
+                item.set_enabled(enabled)
+                break
+
+        status_lines = [
+            f"**{MODULE_LABELS[name]}:** "
+            f"{'Active' if state else 'Disabled'}"
+            for name, state in states.items()
+        ]
+        embed = create_module_embed(
+            "Server Modules",
+            "\n".join(status_lines),
+            guild.id
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=self
+        )
+
+
 async def set_module_enabled(
     interaction: discord.Interaction,
     module_name: str,
@@ -5430,50 +5606,14 @@ async def set_module_enabled(
         )
         return
 
-    guild_id = str(guild.id)
-    settings = get_server_settings(guild.id)
-    modules = settings.get("modules", {})
-    if not isinstance(modules, dict):
-        print(
-            f"[MODULES] Invalid module settings for guild {guild_id}."
-        )
+    error = save_module_state(guild.id, module_name, enabled)
+    if error is not None:
         await interaction.response.send_message(
-            "Module settings are invalid. Please contact support.",
+            error,
             ephemeral=True
         )
         return
 
-    current_state = modules.get(module_name, True)
-    if not isinstance(current_state, bool):
-        print(
-            f"[MODULES] Invalid {module_name} module state for guild "
-            f"{guild_id}."
-        )
-        await interaction.response.send_message(
-            "This module's settings are invalid. Please contact support.",
-            ephemeral=True
-        )
-        return
-
-    updated_settings = {
-        **settings,
-        "modules": {
-            **modules,
-            module_name: enabled,
-        },
-    }
-    updated_server_settings = {
-        **server_settings,
-        guild_id: updated_settings,
-    }
-    if not save_json(SETTINGS_FILE, updated_server_settings):
-        await interaction.response.send_message(
-            "The module setting could not be saved. Please try again later.",
-            ephemeral=True
-        )
-        return
-
-    server_settings[guild_id] = updated_settings
     state_label = "enabled" if enabled else "disabled"
     await send_module_embed(
         interaction,
@@ -5501,26 +5641,26 @@ async def modules_command(interaction: discord.Interaction):
         return
 
     settings = get_server_settings(guild.id)
-    status_lines = []
-    for module_name, label in MODULE_LABELS.items():
-        enabled = get_module_enabled(settings, module_name)
-        if enabled is None:
-            print(
-                f"[MODULES] Invalid {module_name} module state for guild "
-                f"{guild.id}."
-            )
-            await interaction.response.send_message(
-                "Module settings are invalid. Please contact support.",
-                ephemeral=True
-            )
-            return
-        status = "Active" if enabled else "Disabled"
-        status_lines.append(f"**{label}:** {status}")
+    states = get_module_states(settings)
+    if states is None:
+        print(f"[MODULES] Invalid module state for guild {guild.id}.")
+        await interaction.response.send_message(
+            "Module settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    status_lines = [
+        f"**{MODULE_LABELS[module_name]}:** "
+        f"{'Active' if enabled else 'Disabled'}"
+        for module_name, enabled in states.items()
+    ]
 
     await send_module_embed(
         interaction,
         "Server Modules",
-        "\n".join(status_lines)
+        "\n".join(status_lines),
+        view=ModuleToggleView(states)
     )
 
 
@@ -5713,22 +5853,22 @@ async def admin_help_command(
 
     embed.add_field(
         name="/modules",
-        value="Show whether the Giveaways, Levelling, and Economy modules are active in this server.",
+        value="Show module status and toggle modules with the buttons. Administrators only.",
         inline=False
     )
     embed.add_field(
         name="/module-giveaways",
-        value="Enable or disable the Giveaways module. Administrators only.",
+        value="Alternative command to enable or disable the Giveaways module.",
         inline=False
     )
     embed.add_field(
         name="/module-levelling",
-        value="Enable or disable the Levelling module. Administrators only.",
+        value="Alternative command to enable or disable the Levelling module.",
         inline=False
     )
     embed.add_field(
         name="/module-economy",
-        value="Enable or disable the Economy module. Administrators only.",
+        value="Alternative command to enable or disable the Economy module.",
         inline=False
     )
 
