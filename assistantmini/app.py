@@ -5878,6 +5878,7 @@ def save_module_state(
     server_settings[guild_id_str] = updated_settings
     return None
 
+
 def save_logging_setting(
     guild_id: int,
     setting_name: str,
@@ -7027,60 +7028,8 @@ async def help_command(
     )
 
     embed.add_field(
-        name="/economy-wallet",
-        value=f"Check your current {CURRENCY_SYMBOL} coin balance.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-bank",
-        value="Check the coins stored in your bank.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-bank-deposit",
-        value="Move coins from your wallet into your bank.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-bank-withdraw",
-        value="Move coins from your bank into your wallet.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-daily",
-        value=(
-            f"Claim {CURRENCY_SYMBOL}{DAILY_REWARD:,} once every 24 hours."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-weekly",
-        value=(
-            f"Claim {CURRENCY_SYMBOL}{WEEKLY_REWARD:,} once every 7 days."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-coin-flip",
-        value=f"Bet a positive amount of {CURRENCY_SYMBOL} coins on heads or tails. A correct guess pays back twice your bet.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-pay",
-        value=f"Transfer a chosen amount of {CURRENCY_SYMBOL} coins to another server member.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/economy-leaderboard",
-        value="Show the top 10 EconomyMini players globally by wallet and bank coins.",
+        name="/economy-",
+        value=f"`Daily`, `Weekly`, `Bank`, `Bank Deposit`, `Bank Withdraw`, `Coin Flip`, `Pay`, `Leaderboard`.",
         inline=False
     )
 
@@ -7132,34 +7081,11 @@ async def admin_help_command(
 
     embed.add_field(
         name="/modules",
-        value="Show module status and toggle modules with the buttons. Administrators only.",
+        value="Show module status and toggle modules with the buttons. Administrators only.\n"
+        "Use /module-giveaways, /module-levelling, /module-economy, /module-logging, or /module-counting /module-automod.",
         inline=False
     )
-    embed.add_field(
-        name="/module-giveaways",
-        value="Alternative command to enable or disable the Giveaways module.",
-        inline=False
-    )
-    embed.add_field(
-        name="/module-levelling",
-        value="Alternative command to enable or disable the Levelling module.",
-        inline=False
-    )
-    embed.add_field(
-        name="/module-economy",
-        value="Alternative command to enable or disable the Economy module.",
-        inline=False
-    )
-    embed.add_field(
-        name="/module-logging",
-        value="Enable or disable the Logging module. Set a log destination with /log-channel first.",
-        inline=False
-    )
-    embed.add_field(
-        name="/module-counting",
-        value="Enable or disable the Counting module.",
-        inline=False
-    )
+
     embed.add_field(
         name="Moderation and AutoMod commands",
         value=(
@@ -7179,28 +7105,16 @@ async def admin_help_command(
         name="/counting-channel",
         value=(
             "Set a text channel for counting. Administrators only; "
-            "1 channel per server, or 5 with Premium."
+            "1 channel per server, or 5 with Premium.\n"
+            "/counting-channel-remove"
         ),
         inline=False
     )
-    embed.add_field(
-        name="/counting-channel-remove",
-        value="Remove a channel from counting. Administrators only.",
-        inline=False
-    )
+
     embed.add_field(
         name="/log-channel",
-        value="Choose the channel for edited and deleted message logs. Administrators only.",
-        inline=False
-    )
-    embed.add_field(
-        name="/log-exclude-channel",
-        value="Toggle edited and deleted message logging for a channel. Administrators only.",
-        inline=False
-    )
-    embed.add_field(
-        name="/log-channel-exclude-list",
-        value="Show channels excluded from message logging. Administrators only.",
+        value="Choose the channel for edited and deleted message logs. Administrators only.\n"
+        "log-exclude-channel, /log-channel-exclude-list",
         inline=False
     )
 
@@ -7208,75 +7122,17 @@ async def admin_help_command(
         name="/giveaway-create",
         value=(
             "Create a giveaway.\n"
-            "Administrators only."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="/giveaway-reroll",
-        value="Pick a replacement winner for a completed giveaway using its Giveaway ID. Administrators only; available for 48 hours.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/giveaway-role-entry",
-        value=(
-            "Set the total number of giveaway tickets for a role. "
-            "Members with several configured roles receive the highest "
-            "matching ticket count. Administrators only; 2 roles per "
-            "server, or 10 with Premium."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="/giveaway-role-entry-remove",
-        value="Remove a role's giveaway ticket bonus. Administrators only.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/giveaway-role-entry-list",
-        value=(
-            "List roles with additional giveaway entries. "
             "Administrators only.\n"
+            "/giveaway-reroll, /giveaway-role-entry (2 Per Server/ 10 Premium), /giveaway-role-entry-remove, /giveaway-role-entry-list"
         ),
         inline=False
     )
+
     embed.add_field(
         name="/level-channel-exclude",
-        value="Add channels excluded from level experience. Administrators only.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/level-channel-exclude-list",
-        value="Show channels excluded from level experience. Administrators only.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/level-channel-exclude-remove",
-        value="Allow a channel to earn level experience again. Administrators only.\n",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/level-set",
-        value="Set a member's level and reset their current-level XP. Administrators only.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/level-xp-add",
-        value="Add XP to a member, including automatic level-ups. Administrators only.",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/level-xp-remove",
-        value="Remove XP, rolling back levels as needed without going below level 0. Administrators only.",
+        value="Add channels excluded from level experience. Administrators only.\n"
+        "/level-channel-exclude-remove, /level-channel-exclude-list\n"
+        "Use /level-set, /level-xp-add, or /level-xp-remove to manage member levels and XP.",
         inline=False
     )
 
