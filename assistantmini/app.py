@@ -75,6 +75,7 @@ MODULE_LABELS = {
     "levelling": "Levelling",
     "economy": "Economy",
     "logging": "Logging",
+    "counting": "Counting",
 }
 MODULE_COMMANDS = {
     "giveaways": {
@@ -107,6 +108,10 @@ MODULE_COMMANDS = {
         "economy-job-quit",
         "economy-profile",
         "economy-leaderboard",
+    },
+    "counting": {
+        "counting-channel",
+        "counting-channel-remove",
     },
 }
 COMMAND_MODULES = {
@@ -256,6 +261,7 @@ def get_default_server_settings():
         "streamer": None,
         "assistantmini_premium": False,
         "giveaway_role_entries": {},
+        "counting_channels": {},
         "modules": {
             module_name: module_name != "logging"
             for module_name in MODULE_LABELS
@@ -337,6 +343,7 @@ if not isinstance(guild_leveling_userdata, dict):
         f"{GUILD_LEVELING_USERDATA_FILE} must contain a JSON object."
     )
 guild_leveling_lock = asyncio.Lock()
+counting_lock = asyncio.Lock()
 
 
 def get_guild_level_xp_required(level):
@@ -2153,6 +2160,227 @@ async def on_entitlement_create(entitlement: discord.Entitlement):
             entitlement.user_id,
             entitlement.id
         )
+
+
+# ============================================================
+# Counting
+# ============================================================
+
+def get_counting_channels(settings):
+    channels = settings.get("counting_channels", {})
+    if not isinstance(channels, dict):
+        return None
+
+    for channel_id, state in channels.items():
+        if not isinstance(channel_id, str) or not channel_id.isdigit():
+            return None
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("count"), int)
+            or isinstance(state.get("count"), bool)
+            or state["count"] < 0
+            or "last_user_id" not in state
+            or (
+                state.get("last_user_id") is not None
+                and (
+                    not isinstance(state.get("last_user_id"), str)
+                    or not state["last_user_id"].isdigit()
+                )
+            )
+        ):
+            return None
+
+    return channels
+
+
+def save_counting_channels(guild_id: int, channels: dict) -> bool:
+    guild_id_str = str(guild_id)
+    updated_settings = {
+        **get_server_settings(guild_id),
+        "counting_channels": channels,
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return False
+
+    server_settings[guild_id_str] = updated_settings
+    return True
+
+
+async def require_counting_admin(
+    interaction: discord.Interaction
+) -> bool:
+    if (
+        interaction.guild is not None
+        and isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    ):
+        return True
+
+    await interaction.response.send_message(
+        "You need the Administrator permission to manage counting channels.",
+        ephemeral=True
+    )
+    return False
+
+
+@client.tree.command(
+    name="counting-channel",
+    description="Set a channel where members can count together."
+)
+@app_commands.describe(channel="The text channel to use for counting.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def counting_channel_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    if not await require_counting_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.response.send_message(
+            "I couldn't verify my permissions in that server. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.send_messages or not permissions.add_reactions:
+        await interaction.response.send_message(
+            "I need permission to send messages and add reactions in "
+            f"{channel.mention} before it can be used for counting.",
+            ephemeral=True
+        )
+        return
+
+    async with counting_lock:
+        settings = get_server_settings(guild.id)
+        channels = get_counting_channels(settings)
+        if channels is None:
+            print(
+                f"[COUNTING] Invalid counting channel settings for guild "
+                f"{guild.id}."
+            )
+            await interaction.response.send_message(
+                "Counting settings are invalid. Please contact support.",
+                ephemeral=True
+            )
+            return
+
+        channel_id = str(channel.id)
+        if channel_id in channels:
+            await interaction.response.send_message(
+                f"{channel.mention} is already a counting channel.",
+                ephemeral=True
+            )
+            return
+
+        limit = 5 if settings.get("assistantmini_premium") is True else 1
+        if len(channels) >= limit:
+            await interaction.response.send_message(
+                f"This server has reached its limit of {limit} counting "
+                f"channel{'s' if limit != 1 else ''}. "
+                + (
+                    "Premium servers can set up to 5 counting channels."
+                    if limit == 1
+                    else "Remove a counting channel before adding another."
+                ),
+                ephemeral=True
+            )
+            return
+
+        updated_channels = {
+            **channels,
+            channel_id: {
+                "count": 0,
+                "last_user_id": None,
+            },
+        }
+        if not save_counting_channels(guild.id, updated_channels):
+            await interaction.response.send_message(
+                "I couldn't save the counting channel settings. Please try again.",
+                ephemeral=True
+            )
+            return
+
+    await interaction.response.send_message(
+        f"{channel.mention} is now a counting channel. The next number is 1 "
+        f"({len(updated_channels)}/{limit} configured).",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="counting-channel-remove",
+    description="Remove a channel from the counting game."
+)
+@app_commands.describe(channel="The counting channel to remove.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def counting_channel_remove_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    if not await require_counting_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    async with counting_lock:
+        settings = get_server_settings(guild.id)
+        channels = get_counting_channels(settings)
+        if channels is None:
+            print(
+                f"[COUNTING] Invalid counting channel settings for guild "
+                f"{guild.id}."
+            )
+            await interaction.response.send_message(
+                "Counting settings are invalid. Please contact support.",
+                ephemeral=True
+            )
+            return
+
+        channel_id = str(channel.id)
+        if channel_id not in channels:
+            await interaction.response.send_message(
+                f"{channel.mention} is not a counting channel.",
+                ephemeral=True
+            )
+            return
+
+        updated_channels = dict(channels)
+        del updated_channels[channel_id]
+        if not save_counting_channels(guild.id, updated_channels):
+            await interaction.response.send_message(
+                "I couldn't save the counting channel settings. Please try again.",
+                ephemeral=True
+            )
+            return
+
+    await interaction.response.send_message(
+        f"{channel.mention} is no longer a counting channel.",
+        ephemeral=True
+    )
 
 
 # ============================================================
@@ -6076,6 +6304,20 @@ async def module_logging_command(
 
 
 @client.tree.command(
+    name="module-counting",
+    description="Enable or disable the Counting module."
+)
+@app_commands.describe(enabled="Whether the Counting module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_counting_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "counting", enabled)
+
+
+@client.tree.command(
     name="log-channel",
     description="Set the channel where edited and deleted messages are logged."
 )
@@ -6409,6 +6651,24 @@ async def admin_help_command(
         inline=False
     )
     embed.add_field(
+        name="/module-counting",
+        value="Enable or disable the Counting module.",
+        inline=False
+    )
+    embed.add_field(
+        name="/counting-channel",
+        value=(
+            "Set a text channel for counting. Administrators only; "
+            "1 channel per server, or 5 with Premium."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="/counting-channel-remove",
+        value="Remove a channel from counting. Administrators only.",
+        inline=False
+    )
+    embed.add_field(
         name="/log-channel",
         value="Choose the channel for edited and deleted message logs. Administrators only.",
         inline=False
@@ -6723,8 +6983,132 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
             )
 
 
+async def process_counting_message(message: discord.Message) -> None:
+    if (
+        message.guild is None
+        or message.author.bot
+        or message.webhook_id is not None
+    ):
+        return
+
+    guild_id = message.guild.id
+    settings = get_server_settings(guild_id)
+    enabled = get_module_enabled(settings, "counting")
+    if enabled is None:
+        print(
+            f"[COUNTING] Invalid module settings for guild {guild_id}; "
+            "message was not counted."
+        )
+        return
+    if not enabled:
+        return
+
+    channels = get_counting_channels(settings)
+    if channels is None:
+        print(
+            f"[COUNTING] Invalid counting channel settings for guild "
+            f"{guild_id}; message was not counted."
+        )
+        return
+
+    channel_id = str(message.channel.id)
+    if channel_id not in channels:
+        return
+
+    async with counting_lock:
+        settings = get_server_settings(guild_id)
+        enabled = get_module_enabled(settings, "counting")
+        if enabled is not True:
+            if enabled is None:
+                print(
+                    f"[COUNTING] Invalid module settings for guild "
+                    f"{guild_id}; message was not counted."
+                )
+            return
+
+        channels = get_counting_channels(settings)
+        if channels is None:
+            print(
+                f"[COUNTING] Invalid counting channel settings for guild "
+                f"{guild_id}; message was not counted."
+            )
+            return
+
+        state = channels.get(channel_id)
+        if state is None:
+            return
+
+        expected = state["count"] + 1
+        user_id = str(message.author.id)
+        if re.fullmatch(r"[0-9]+", message.content) is None:
+            reset_reason = "the message was not just a number"
+        elif state["last_user_id"] == user_id:
+            reset_reason = "the same person counted twice in a row"
+        elif int(message.content) != expected:
+            reset_reason = f"the correct next number was {expected}"
+        else:
+            reset_reason = None
+
+        if reset_reason is None:
+            updated_state = {
+                "count": expected,
+                "last_user_id": user_id,
+            }
+            reaction = "✅"
+        else:
+            updated_state = {
+                "count": 0,
+                "last_user_id": None,
+            }
+            reaction = "❌"
+
+        updated_channels = {
+            **channels,
+            channel_id: updated_state,
+        }
+        if not save_counting_channels(guild_id, updated_channels):
+            print(
+                f"[COUNTING] Could not save state for channel "
+                f"{channel_id} in guild {guild_id}; message was not counted."
+            )
+            try:
+                await message.channel.send(
+                    "Counting is paused because I couldn't save the game "
+                    "state. Please contact a server administrator."
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[COUNTING] Could not report a save failure in channel "
+                    f"{channel_id}: {error}"
+                )
+            return
+
+        try:
+            await message.add_reaction(reaction)
+        except discord.HTTPException as error:
+            print(
+                f"[COUNTING] Could not add {reaction} to message "
+                f"{message.id}: {error}"
+            )
+
+        if reset_reason is not None:
+            try:
+                await message.channel.send(
+                    f"The count reset because {reset_reason}. "
+                    "The count is now 0; the next number is 1.",
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[COUNTING] Could not announce the reset in channel "
+                    f"{channel_id}: {error}"
+                )
+
+
 @client.event
 async def on_message(message: discord.Message):
+    await process_counting_message(message)
+
     if message.guild is not None and not message.author.bot:
         settings = get_server_settings(message.guild.id)
         logging_enabled = get_module_enabled(settings, "logging")
