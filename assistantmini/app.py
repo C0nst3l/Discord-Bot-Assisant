@@ -5444,11 +5444,17 @@ async def send_module_embed(
         interaction.guild.id if interaction.guild is not None else None
     )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
-        view=view
-    )
+    if view is None:
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+            view=view
+        )
 
 
 async def require_module_admin(
