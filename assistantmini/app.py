@@ -6111,11 +6111,11 @@ async def log_channel_command(
 
 
 @client.tree.command(
-    name="log-channel-exclude",
-    description="Exclude a channel from edited and deleted message logging."
+    name="log-exclude-channel",
+    description="Toggle edited and deleted message logging for a channel."
 )
 @app_commands.describe(
-    channel="The channel that should not be checked for message changes."
+    channel="The channel to include or exclude from message logging."
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
@@ -6153,26 +6153,33 @@ async def log_channel_exclude_command(
         return
 
     channel_id = str(channel.id)
-    if channel_id in excluded_channels:
-        await interaction.response.send_message(
-            f"{channel.mention} is already excluded from message logging.",
-            ephemeral=True
-        )
-        return
+    is_excluded = channel_id in excluded_channels
+    updated_excluded_channels = (
+        [
+            item for item in excluded_channels
+            if item != channel_id
+        ]
+        if is_excluded
+        else [*excluded_channels, channel_id]
+    )
 
     if not save_logging_setting(
         guild.id,
         "log_excluded_channels",
-        [*excluded_channels, channel_id]
+        updated_excluded_channels
     ):
         await interaction.response.send_message(
-            "The channel exclusion could not be saved. Please try again later.",
+            "The channel logging setting could not be saved. Please try again later.",
             ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-        f"{channel.mention} is now excluded from message logging.",
+        (
+            f"Message logging is now enabled for {channel.mention}."
+            if is_excluded
+            else f"{channel.mention} is now excluded from message logging."
+        ),
         ephemeral=True
     )
 
@@ -6407,8 +6414,8 @@ async def admin_help_command(
         inline=False
     )
     embed.add_field(
-        name="/log-channel-exclude",
-        value="Exclude a channel from edited and deleted message logging. Administrators only.",
+        name="/log-exclude-channel",
+        value="Toggle edited and deleted message logging for a channel. Administrators only.",
         inline=False
     )
     embed.add_field(
