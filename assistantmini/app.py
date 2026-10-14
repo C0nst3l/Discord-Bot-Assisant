@@ -51,6 +51,7 @@ DAILY_REWARD = 500
 DAILY_COOLDOWN = 24 * 60 * 60
 WEEKLY_REWARD = 5000
 WEEKLY_COOLDOWN = 7 * 24 * 60 * 60
+AUTOMOD_ENTRY_SPLIT_PATTERN = re.compile(r"[,./|]+")
 LEVEL_UP_EXPERIENCE = 100
 LEVEL_REWARD_EXPERIENCE = 5
 GUILD_LEVEL_XP_MIN = 15
@@ -76,6 +77,7 @@ MODULE_LABELS = {
     "economy": "Economy",
     "logging": "Logging",
     "counting": "Counting",
+    "automod": "AutoMod",
 }
 MODULE_COMMANDS = {
     "giveaways": {
@@ -112,6 +114,12 @@ MODULE_COMMANDS = {
     "counting": {
         "counting-channel",
         "counting-channel-remove",
+    },
+    "automod": {
+        "automod-phrases-add",
+        "automod-phrases-remove",
+        "automod-phrases-list",
+        "automod-log-channel",
     },
 }
 COMMAND_MODULES = {
@@ -262,6 +270,9 @@ def get_default_server_settings():
         "assistantmini_premium": False,
         "giveaway_role_entries": {},
         "counting_channels": {},
+        "automod_phrases": [],
+        "automod_log_channel_id": None,
+        "automod_owner_alerted": False,
         "modules": {
             module_name: module_name != "logging"
             for module_name in MODULE_LABELS
@@ -344,6 +355,7 @@ if not isinstance(guild_leveling_userdata, dict):
     )
 guild_leveling_lock = asyncio.Lock()
 counting_lock = asyncio.Lock()
+automod_owner_alert_locks = {}
 
 
 def get_guild_level_xp_required(level):
@@ -5702,6 +5714,95 @@ async def require_module_admin(
     return False
 
 
+async def require_automod_admin(
+    interaction: discord.Interaction
+) -> bool:
+    if (
+        interaction.guild is not None
+        and isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    ):
+        return True
+
+    await interaction.response.send_message(
+        "You need the Administrator permission to manage AutoMod.",
+        ephemeral=True
+    )
+    return False
+
+
+def get_automod_phrases(settings) -> list[str] | None:
+    phrases = settings.get("automod_phrases", [])
+    if (
+        not isinstance(phrases, list)
+        or any(
+            not isinstance(phrase, str) or not phrase.strip()
+            for phrase in phrases
+        )
+    ):
+        return None
+    return phrases
+
+
+def find_automod_phrase(content: str, phrases: list[str]) -> str | None:
+    for phrase in phrases:
+        if re.search(
+            rf"(?<!\w){re.escape(phrase)}(?!\w)",
+            content,
+            re.IGNORECASE
+        ):
+            return phrase
+    return None
+
+
+async def notify_automod_owner_without_log_channel(
+    guild: discord.Guild
+) -> None:
+    lock = automod_owner_alert_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        settings = get_server_settings(guild.id)
+        alerted = settings.get("automod_owner_alerted", False)
+        if alerted is True:
+            return
+        if not isinstance(alerted, bool):
+            print(
+                f"[AUTOMOD] Invalid owner-alert state for guild {guild.id}; "
+                "attempting to notify the owner."
+            )
+
+        settings["automod_owner_alerted"] = True
+        if not save_automod_settings(guild.id, automod_owner_alerted=True):
+            print(
+                f"[AUTOMOD] Could not save the owner-alert state for guild "
+                f"{guild.id}; the owner will still be notified."
+            )
+
+        owner = guild.owner
+        if owner is None:
+            try:
+                owner = await client.fetch_user(guild.owner_id)
+            except discord.HTTPException as error:
+                print(
+                    f"[AUTOMOD] Could not find the owner of guild "
+                    f"{guild.id} to report the missing log channel: {error}"
+                )
+                return
+
+        try:
+            await owner.send(
+                f"AutoMod detected a restricted-word message in **{guild.name}**, "
+                "but no AutoMod log channel is configured. Set one with "
+                "/automod-log-channel.",
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException as error:
+            print(
+                f"[AUTOMOD] Could not notify the owner of guild {guild.id} "
+                f"about the missing log channel: {error}"
+            )
+            return
+
+
 def get_module_states(settings) -> dict[str, bool] | None:
     states = {}
     for module_name in MODULE_LABELS:
@@ -5786,6 +5887,28 @@ def save_logging_setting(
     updated_settings = {
         **settings,
         setting_name: value,
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return False
+
+    server_settings[guild_id_str] = updated_settings
+    return True
+
+
+def save_automod_settings(guild_id: int, **updates) -> bool:
+    guild_id_str = str(guild_id)
+    settings = get_server_settings(guild_id)
+    if not isinstance(settings, dict):
+        print(f"[AUTOMOD] Invalid settings for guild {guild_id_str}.")
+        return False
+
+    updated_settings = {
+        **settings,
+        **updates,
     }
     updated_server_settings = {
         **server_settings,
@@ -6318,6 +6441,278 @@ async def module_counting_command(
 
 
 @client.tree.command(
+    name="module-automod",
+    description="Enable or disable the AutoMod module."
+)
+@app_commands.describe(enabled="Whether the AutoMod module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_automod_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "automod", enabled)
+
+
+@client.tree.command(
+    name="automod-phrases-add",
+    description="Add restricted words for this server."
+)
+@app_commands.describe(
+    phrases="Separate words with commas, periods, slashes, or vertical bars."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def automod_phrases_add_command(
+    interaction: discord.Interaction,
+    phrases: str
+):
+    if not await require_automod_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    additions = [
+        phrase.strip()
+        for phrase in AUTOMOD_ENTRY_SPLIT_PATTERN.split(phrases)
+        if phrase.strip()
+    ]
+    if not additions:
+        await interaction.response.send_message(
+            "Enter at least one word to restrict.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    current_phrases = get_automod_phrases(settings)
+    if current_phrases is None:
+        print(f"[AUTOMOD] Invalid restricted-word list for guild {guild.id}.")
+        await interaction.response.send_message(
+            "AutoMod's saved restricted-word list is invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    current_phrases = list(current_phrases)
+    existing = {phrase.casefold() for phrase in current_phrases}
+    added = []
+    for phrase in additions:
+        normalized = phrase.casefold()
+        if normalized not in existing:
+            current_phrases.append(phrase)
+            existing.add(normalized)
+            added.append(phrase)
+
+    if not added:
+        await interaction.response.send_message(
+            "All of those words are already restricted.",
+            ephemeral=True
+        )
+        return
+
+    if not save_automod_settings(guild.id, automod_phrases=current_phrases):
+        await interaction.response.send_message(
+            "The restricted words could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Added {len(added)} restricted word(s).",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="automod-phrases-remove",
+    description="Remove a word from this server's restricted list."
+)
+@app_commands.describe(word="The restricted word to remove.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def automod_phrases_remove_command(
+    interaction: discord.Interaction,
+    word: str
+):
+    if not await require_automod_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    current_phrases = get_automod_phrases(settings)
+    if current_phrases is None:
+        print(f"[AUTOMOD] Invalid restricted-word list for guild {guild.id}.")
+        await interaction.response.send_message(
+            "AutoMod's saved restricted-word list is invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    normalized_word = word.strip().casefold()
+    if not normalized_word:
+        await interaction.response.send_message(
+            "Enter the restricted word to remove.",
+            ephemeral=True
+        )
+        return
+
+    remaining_phrases = [
+        phrase
+        for phrase in current_phrases
+        if phrase.casefold() != normalized_word
+    ]
+    if len(remaining_phrases) == len(current_phrases):
+        await interaction.response.send_message(
+            f"`{word.strip()}` is not in the restricted-word list.",
+            ephemeral=True
+        )
+        return
+
+    if not save_automod_settings(
+        guild.id,
+        automod_phrases=remaining_phrases
+    ):
+        await interaction.response.send_message(
+            "The restricted words could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Removed `{word.strip()}` from the restricted-word list.",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="automod-phrases-list",
+    description="List this server's restricted words."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def automod_phrases_list_command(interaction: discord.Interaction):
+    if not await require_automod_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    current_phrases = get_automod_phrases(get_server_settings(guild.id))
+    if current_phrases is None:
+        print(f"[AUTOMOD] Invalid restricted-word list for guild {guild.id}.")
+        await interaction.response.send_message(
+            "AutoMod's saved restricted-word list is invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    if not current_phrases:
+        await interaction.response.send_message(
+            "This server has no restricted words configured.",
+            ephemeral=True
+        )
+        return
+
+    chunks = []
+    current_chunk = "Restricted words:\n"
+    for phrase in current_phrases:
+        line = f"- {phrase}\n"
+        if len(current_chunk) + len(line) > 1900:
+            chunks.append(current_chunk.rstrip())
+            current_chunk = ""
+        current_chunk += line
+    if current_chunk:
+        chunks.append(current_chunk.rstrip())
+
+    await interaction.response.send_message(
+        chunks[0],
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+    for chunk in chunks[1:]:
+        await interaction.followup.send(
+            chunk,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+
+@client.tree.command(
+    name="automod-log-channel",
+    description="Set the channel for AutoMod restricted-word reports."
+)
+@app_commands.describe(channel="The channel that will receive AutoMod reports.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def automod_log_channel_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    if not await require_automod_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None or channel.guild.id != guild.id:
+        await interaction.response.send_message(
+            "Choose a text channel from this server.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.response.send_message(
+            "I couldn't verify my permissions in that server. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.send_messages or not permissions.embed_links:
+        await interaction.response.send_message(
+            "I need permission to send messages and embed links in "
+            f"{channel.mention} before it can receive AutoMod reports.",
+            ephemeral=True
+        )
+        return
+
+    if not save_automod_settings(
+        guild.id,
+        automod_log_channel_id=str(channel.id),
+        automod_owner_alerted=False
+    ):
+        await interaction.response.send_message(
+            "The AutoMod log channel could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"AutoMod reports will be sent to {channel.mention}.",
+        ephemeral=True
+    )
+
+
+@client.tree.command(
     name="log-channel",
     description="Set the channel where edited and deleted messages are logged."
 )
@@ -6653,6 +7048,19 @@ async def admin_help_command(
     embed.add_field(
         name="/module-counting",
         value="Enable or disable the Counting module.",
+        inline=False
+    )
+    embed.add_field(
+        name="AutoMod commands",
+        value=(
+            "/module-automod — Enable or disable AutoMod.\n"
+            "/automod-phrases-add — Add restricted words separated by "
+            "commas, periods, slashes, or vertical bars.\n"
+            "/automod-phrases-remove — Remove a restricted word.\n"
+            "/automod-phrases-list — Show restricted words.\n"
+            "/automod-log-channel — Set or change the report channel.\n"
+            "Administrators only."
+        ),
         inline=False
     )
     embed.add_field(
@@ -7105,8 +7513,127 @@ async def process_counting_message(message: discord.Message) -> None:
                 )
 
 
+async def process_automod_message(message: discord.Message) -> bool:
+    guild = message.guild
+    if guild is None or message.author.bot:
+        return False
+
+    settings = get_server_settings(guild.id)
+    enabled = get_module_enabled(settings, "automod")
+    if enabled is None:
+        print(
+            f"[AUTOMOD] Invalid module settings for guild {guild.id}; "
+            "message was not checked."
+        )
+        return False
+    if not enabled:
+        return False
+
+    phrases = get_automod_phrases(settings)
+    if phrases is None:
+        print(
+            f"[AUTOMOD] Invalid restricted-word list for guild {guild.id}; "
+            "message was not checked."
+        )
+        return False
+
+    matched_phrase = find_automod_phrase(message.content, phrases)
+    if matched_phrase is None:
+        return False
+
+    deletion_succeeded = False
+    bot_member = guild.me
+    if bot_member is None:
+        print(
+            f"[AUTOMOD] Could not verify bot permissions in guild {guild.id}; "
+            f"message {message.id} was not deleted."
+        )
+    elif not message.channel.permissions_for(bot_member).manage_messages:
+        print(
+            f"[AUTOMOD] Missing Manage Messages permission in channel "
+            f"{message.channel.id}; message {message.id} was not deleted."
+        )
+    else:
+        try:
+            await message.delete()
+            deletion_succeeded = True
+        except discord.HTTPException as error:
+            print(
+                f"[AUTOMOD] Could not delete restricted-word message "
+                f"{message.id} in guild {guild.id}: {error}"
+            )
+
+    log_channel_id = settings.get("automod_log_channel_id")
+    log_channel = None
+    if isinstance(log_channel_id, str) and log_channel_id.isdigit():
+        log_channel = guild.get_channel(int(log_channel_id))
+        if log_channel is None:
+            try:
+                log_channel = await guild.fetch_channel(int(log_channel_id))
+            except discord.HTTPException as error:
+                print(
+                    f"[AUTOMOD] Could not resolve log channel "
+                    f"{log_channel_id} for guild {guild.id}: {error}"
+                )
+
+    if not isinstance(log_channel, discord.TextChannel):
+        print(
+            f"[AUTOMOD] No usable log channel is configured for guild "
+            f"{guild.id}; notifying its owner."
+        )
+        await notify_automod_owner_without_log_channel(guild)
+        return True
+
+    report = discord.Embed(
+        title=(
+            "AutoMod restricted-word message deleted"
+            if deletion_succeeded
+            else "AutoMod restricted-word message could not be deleted"
+        ),
+        description=(
+            f"**Member:** {message.author.mention} (`{message.author.id}`)\n"
+            f"**Channel:** {message.channel.mention}"
+        ),
+        colour=discord.Colour.red()
+    )
+    report.add_field(
+        name="Restricted word",
+        value=matched_phrase[:1024],
+        inline=True
+    )
+    report.add_field(
+        name="Message",
+        value=message.content[:1024] or "[No text content]",
+        inline=False
+    )
+    report.add_field(
+        name="Message link",
+        value=(
+            f"[Jump to message](https://discord.com/channels/{guild.id}/"
+            f"{message.channel.id}/{message.id})"
+        ),
+        inline=False
+    )
+
+    try:
+        await log_channel.send(
+            embed=report,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.HTTPException as error:
+        print(
+            f"[AUTOMOD] Could not send a report for message {message.id} "
+            f"to channel {log_channel.id}: {error}"
+        )
+
+    return True
+
+
 @client.event
 async def on_message(message: discord.Message):
+    if await process_automod_message(message):
+        return
+
     await process_counting_message(message)
 
     if message.guild is not None and not message.author.bot:
