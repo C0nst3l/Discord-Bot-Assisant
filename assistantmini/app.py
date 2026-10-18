@@ -58,7 +58,7 @@ GUILD_LEVEL_XP_MIN = 15
 GUILD_LEVEL_XP_MAX = 30
 GUILD_LEVEL_XP_COOLDOWN = 60
 PRIVATE_ECONOMY_EMBED_COMMANDS = {
-    "economy coinflip",
+    "economy coin flip",
     "economy daily",
     "economy weekly",
     "economy wallet",
@@ -7145,7 +7145,7 @@ async def admin_help_command(
 
     embed.add_field(
         name="/dashboard",
-        value="Open the Mini Assistants Dashboard.",
+        value="Open the Mini Assistants current Dashboard.",
         inline=False
     )
 
