@@ -5990,6 +5990,22 @@ def create_message_snapshot(message: discord.Message) -> dict:
     }
 
 
+def message_snapshot_contains_gif(snapshot: dict) -> bool:
+    if "gif" in snapshot.get("content", "").lower():
+        return True
+
+    return any(
+        "gif" in value.lower()
+        for attachment in snapshot.get("attachments", [])
+        if isinstance(attachment, dict)
+        for value in (
+            attachment.get("filename", ""),
+            attachment.get("url", "")
+        )
+        if isinstance(value, str)
+    )
+
+
 def prune_expired_message_snapshots() -> None:
     connection = get_message_log_cache_connection()
     connection.execute(
@@ -7257,6 +7273,21 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if isinstance(raw_author_name, str) and raw_author_name:
         updated["author_name"] = raw_author_name
 
+    contains_gif = (
+        message_snapshot_contains_gif(original)
+        or message_snapshot_contains_gif(updated)
+    )
+    try:
+        store_message_snapshot(guild.id, payload.message_id, updated)
+    except sqlite3.Error as error:
+        print(
+            f"[LOGGING] Could not save updated snapshot for message "
+            f"{payload.message_id}: {error}"
+        )
+
+    if contains_gif:
+        return
+
     embed = create_message_log_embed(
         "Edited",
         guild.id,
@@ -7265,13 +7296,6 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         updated
     )
     await send_message_log(guild, embed)
-    try:
-        store_message_snapshot(guild.id, payload.message_id, updated)
-    except sqlite3.Error as error:
-        print(
-            f"[LOGGING] Could not save updated snapshot for message "
-            f"{payload.message_id}: {error}"
-        )
 
 
 @client.event
