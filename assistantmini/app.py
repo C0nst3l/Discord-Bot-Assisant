@@ -58,18 +58,18 @@ GUILD_LEVEL_XP_MIN = 15
 GUILD_LEVEL_XP_MAX = 30
 GUILD_LEVEL_XP_COOLDOWN = 60
 PRIVATE_ECONOMY_EMBED_COMMANDS = {
-    "economy coin flip",
-    "economy daily",
-    "economy weekly",
-    "economy wallet",
-    "economy bank",
-    "economy bank deposit",
-    "economy bank withdraw",
-    "economy job apply",
-    "economy job work",
-    "economy work shift",
-    "economy job quit",
-    "economy leaderboard",
+    "economy-coin-flip",
+    "economy-daily",
+    "economy-weekly",
+    "economy-wallet",
+    "economy-bank",
+    "economy-bank-deposit",
+    "economy-bank-withdraw",
+    "economy-job-apply",
+    "economy-job-work",
+    "economy-work-shift",
+    "economy-job-quit",
+    "economy-leaderboard",
 }
 MODULE_LABELS = {
     "giveaways": "Giveaways",
@@ -81,45 +81,45 @@ MODULE_LABELS = {
 }
 MODULE_COMMANDS = {
     "giveaways": {
-        "giveaway create",
-        "giveaway reroll",
-        "giveaway role entry",
-        "giveaway role entry remove",
-        "giveaway role entry list",
+        "giveaway-create",
+        "giveaway-reroll",
+        "giveaway-role-entry",
+        "giveaway-role-entry-remove",
+        "giveaway-role-entry-list",
     },
     "levelling": {
         "level",
-        "level set",
-        "level xp add",
-        "level xp remove",
-        "level channel exclude",
-        "level channel exclude remove",
-        "level channel exclude list",
+        "level-set",
+        "level-xp-add",
+        "level-xp-remove",
+        "level-channel-exclude",
+        "level-channel-exclude-remove",
+        "level-channel-exclude-list",
     },
     "economy": {
-        "economy daily",
-        "economy weekly",
-        "economy wallet",
-        "economy bank deposit",
-        "economy bank withdraw",
-        "economy bank",
-        "economy coin flip",
-        "economy pay",
-        "economy job apply",
-        "economy work shift",
-        "economy job quit",
-        "economy profile",
-        "economy leaderboard",
+        "economy-daily",
+        "economy-weekly",
+        "economy-wallet",
+        "economy-bank-deposit",
+        "economy-bank-withdraw",
+        "economy-bank",
+        "economy-coin-flip",
+        "economy-pay",
+        "economy-job-apply",
+        "economy-work-shift",
+        "economy-job-quit",
+        "economy-profile",
+        "economy-leaderboard",
     },
     "counting": {
-        "counting channel",
-        "counting channel remove",
+        "counting-channel",
+        "counting-channel-remove",
     },
     "automod": {
-        "automod phrases add",
-        "automod phrases remove",
-        "automod phrases list",
-        "automod log channel",
+        "automod-phrases-add",
+        "automod-phrases-remove",
+        "automod-phrases-list",
+        "automod-log-channel",
     },
 }
 COMMAND_MODULES = {
@@ -2239,7 +2239,7 @@ async def require_counting_admin(
 
 
 @client.tree.command(
-    name="counting channel",
+    name="counting-channel",
     description="Set a channel where members can count together."
 )
 @app_commands.describe(channel="The text channel to use for counting.")
@@ -2335,7 +2335,7 @@ async def counting_channel_command(
 
 
 @client.tree.command(
-    name="counting channel remove",
+    name="counting-channel-remove",
     description="Remove a channel from the counting game."
 )
 @app_commands.describe(channel="The counting channel to remove.")
@@ -2398,7 +2398,7 @@ async def counting_channel_remove_command(
 # ============================================================
 
 @client.tree.command(
-    name="giveaway create",
+    name="giveaway-create",
     description="Create a new giveaway."
 )
 @app_commands.describe(
@@ -2725,7 +2725,7 @@ async def giveaway_create(
 
 
 @client.tree.command(
-    name="giveaway reroll",
+    name="giveaway-reroll",
     description="Pick a replacement winner for a completed giveaway."
 )
 @app_commands.describe(
@@ -3106,7 +3106,7 @@ async def giveaway_reroll_command(
 # ============================================================
 
 @client.tree.command(
-    name="giveaway role entry",
+    name="giveaway-role-entry",
     description="Give a server role multiple tickets in giveaways."
 )
 @app_commands.describe(
@@ -3211,7 +3211,7 @@ async def giveaway_role_entry(
 
 
 @client.tree.command(
-    name="giveaway role entry remove",
+    name="giveaway-role-entry-remove",
     description="Remove a role's extra giveaway tickets."
 )
 @app_commands.describe(
@@ -3302,7 +3302,7 @@ async def giveaway_role_entry_remove(
 
 
 @client.tree.command(
-    name="giveaway role entry list",
+    name="giveaway-role-entry-list",
     description="List the roles with additional giveaway entries."
 )
 @app_commands.default_permissions(
@@ -3460,7 +3460,7 @@ async def send_economy_embed(
 
 
 @client.tree.command(
-    name="economy daily",
+    name="economy-daily",
     description="Claim your daily currency reward."
 )
 async def daily_command(
@@ -3588,7 +3588,7 @@ async def daily_command(
 
 
 @client.tree.command(
-    name="economy weekly",
+    name="economy-weekly",
     description="Claim your weekly currency reward."
 )
 async def weekly_command(
@@ -3723,7 +3723,7 @@ async def weekly_command(
 
 
 @client.tree.command(
-    name="economy wallet",
+    name="economy-wallet",
     description="Check your current currency balance."
 )
 async def wallet_command(
@@ -3934,7 +3934,7 @@ async def transfer_economy_bank(
 
 
 @client.tree.command(
-    name="economy bank deposit",
+    name="economy-bank-deposit",
     description="Deposit coins from your wallet into your bank."
 )
 @app_commands.describe(coins="The number of coins to deposit.")
@@ -3946,7 +3946,7 @@ async def economy_bank_deposit_command(
 
 
 @client.tree.command(
-    name="economy bank withdraw",
+    name="economy-bank-withdraw",
     description="Withdraw coins from your bank into your wallet."
 )
 @app_commands.describe(coins="The number of coins to withdraw.")
@@ -3958,7 +3958,7 @@ async def economy_bank_withdraw_command(
 
 
 @client.tree.command(
-    name="economy bank",
+    name="economy-bank",
     description="Check how many coins you have stored in your bank."
 )
 async def economy_bank_command(
@@ -4050,7 +4050,7 @@ async def economy_bank_command(
 
 
 @client.tree.command(
-    name="economy coin flip",
+    name="economy-coin-flip",
     description="Bet coins on a random coin flip."
 )
 @app_commands.describe(
@@ -4170,7 +4170,7 @@ async def coin_flip_command(
 
 
 @client.tree.command(
-    name="economy pay",
+    name="economy-pay",
     description="Transfer coins to another server member."
 )
 @app_commands.describe(
@@ -4317,7 +4317,7 @@ async def economy_pay_command(
 
 
 @client.tree.command(
-    name="economy job apply",
+    name="economy-job-apply",
     description="Apply for an economy job."
 )
 @app_commands.choices(
@@ -4837,7 +4837,7 @@ async def economy_job_work_impl(
 
 
 @client.tree.command(
-    name="economy work shift",
+    name="economy-work-shift",
     description="Work a shift at your current economy job."
 )
 async def economy_work_shift_command(
@@ -4852,7 +4852,7 @@ async def economy_work_shift_command(
 
 
 @client.tree.command(
-    name="economy job quit",
+    name="economy-job-quit",
     description="Quit your current economy job."
 )
 async def economy_job_quit_command(
@@ -5162,7 +5162,7 @@ async def guild_level_command(interaction: discord.Interaction):
 
 
 @client.tree.command(
-    name="level set",
+    name="level-set",
     description="Set a member's level and reset their current-level XP."
 )
 @app_commands.describe(
@@ -5180,7 +5180,7 @@ async def level_set_command(
 
 
 @client.tree.command(
-    name="level xp add",
+    name="level-xp-add",
     description="Add level XP to a server member."
 )
 @app_commands.describe(
@@ -5198,7 +5198,7 @@ async def level_xp_add_command(
 
 
 @client.tree.command(
-    name="level xp remove",
+    name="level-xp-remove",
     description="Remove level XP from a server member."
 )
 @app_commands.describe(
@@ -5221,7 +5221,7 @@ async def level_xp_remove_command(
 
 
 @client.tree.command(
-    name="level channel exclude",
+    name="level-channel-exclude",
     description="Exclude a channel from level experience."
 )
 @app_commands.describe(
@@ -5311,7 +5311,7 @@ async def level_channel_exclude_command(
 
 
 @client.tree.command(
-    name="level channel exclude remove",
+    name="level-channel-exclude-remove",
     description="Allow messages in a channel to earn level experience."
 )
 @app_commands.describe(
@@ -5404,7 +5404,7 @@ async def level_channel_exclude_remove_command(
 
 
 @client.tree.command(
-    name="level channel exclude list",
+    name="level-channel-exclude-list",
     description="Show channels excluded from level experience."
 )
 @app_commands.default_permissions(administrator=True)
@@ -5502,7 +5502,7 @@ async def level_channel_exclude_list_command(
 
 
 @client.tree.command(
-    name="economy profile",
+    name="economy-profile",
     description="Show an economy profile."
 )
 @app_commands.describe(
@@ -6393,7 +6393,7 @@ async def modules_command(interaction: discord.Interaction):
 
 
 @client.tree.command(
-    name="module giveaways",
+    name="module-giveaways",
     description="Enable or disable the Giveaways module."
 )
 @app_commands.describe(enabled="Whether the Giveaways module is enabled.")
@@ -6407,7 +6407,7 @@ async def module_giveaways_command(
 
 
 @client.tree.command(
-    name="module levelling",
+    name="module-levelling",
     description="Enable or disable the Levelling module."
 )
 @app_commands.describe(enabled="Whether the Levelling module is enabled.")
@@ -6421,7 +6421,7 @@ async def module_levelling_command(
 
 
 @client.tree.command(
-    name="module economy",
+    name="module-economy",
     description="Enable or disable the Economy module."
 )
 @app_commands.describe(enabled="Whether the Economy module is enabled.")
@@ -6435,7 +6435,7 @@ async def module_economy_command(
 
 
 @client.tree.command(
-    name="module logging",
+    name="module-logging",
     description="Enable or disable the Logging module."
 )
 @app_commands.describe(enabled="Whether the Logging module is enabled.")
@@ -6449,7 +6449,7 @@ async def module_logging_command(
 
 
 @client.tree.command(
-    name="module counting",
+    name="module-counting",
     description="Enable or disable the Counting module."
 )
 @app_commands.describe(enabled="Whether the Counting module is enabled.")
@@ -6463,7 +6463,7 @@ async def module_counting_command(
 
 
 @client.tree.command(
-    name="module automod",
+    name="module-automod",
     description="Enable or disable the AutoMod module."
 )
 @app_commands.describe(enabled="Whether the AutoMod module is enabled.")
@@ -6477,7 +6477,7 @@ async def module_automod_command(
 
 
 @client.tree.command(
-    name="automod phrases add",
+    name="automod-phrases-add",
     description="Add restricted words for this server."
 )
 @app_commands.describe(
@@ -6553,7 +6553,7 @@ async def automod_phrases_add_command(
 
 
 @client.tree.command(
-    name="automod phrases remove",
+    name="automod-phrases-remove",
     description="Remove a word from this server's restricted list."
 )
 @app_commands.describe(word="The restricted word to remove.")
@@ -6621,7 +6621,7 @@ async def automod_phrases_remove_command(
 
 
 @client.tree.command(
-    name="automod phrases list",
+    name="automod-phrases-list",
     description="List this server's restricted words."
 )
 @app_commands.default_permissions(administrator=True)
@@ -6679,7 +6679,7 @@ async def automod_phrases_list_command(interaction: discord.Interaction):
 
 
 @client.tree.command(
-    name="automod log channel",
+    name="automod-log-channel",
     description="Set the channel for AutoMod restricted-word reports."
 )
 @app_commands.describe(channel="The channel that will receive AutoMod reports.")
@@ -6840,7 +6840,7 @@ async def purge_command(
 
 
 @client.tree.command(
-    name="log channel",
+    name="log-channel",
     description="Set the channel where edited and deleted messages are logged."
 )
 @app_commands.describe(channel="The channel that will receive message logs.")
@@ -6875,7 +6875,7 @@ async def log_channel_command(
 
 
 @client.tree.command(
-    name="log exclude channel",
+    name="log-exclude-channel",
     description="Toggle edited and deleted message logging for a channel."
 )
 @app_commands.describe(
@@ -6949,7 +6949,7 @@ async def log_channel_exclude_command(
 
 
 @client.tree.command(
-    name="log channel exclude list",
+    name="log-channel-exclude-list",
     description="Show channels excluded from edited and deleted message logging."
 )
 @app_commands.default_permissions(administrator=True)
@@ -7044,8 +7044,12 @@ async def help_command(
     )
 
     embed.add_field(
-        name="/economy ",
-        value=f"`Daily`, `Weekly`, `Bank`, `Bank Deposit`, `Bank Withdraw`, `Coin Flip`, `Pay`, `Leaderboard`.",
+        name="Economy commands",
+        value=(
+            "`/economy-daily`, `/economy-weekly`, `/economy-bank`, "
+            "`/economy-bank-deposit`, `/economy-bank-withdraw`, "
+            "`/economy-coin-flip`, `/economy-pay`, `/economy-leaderboard`."
+        ),
         inline=False
     )
 
@@ -7066,7 +7070,7 @@ async def help_command(
 
 
 @client.tree.command(
-    name="help admin",
+    name="help-admin",
     description="Show AssistantMini's ADMIN Help commands 1."
 )
 async def admin_help_command(
@@ -7098,36 +7102,39 @@ async def admin_help_command(
     embed.add_field(
         name="/modules",
         value="Show module status and toggle modules with the buttons. Administrators only.\n"
-        "Use /module giveaways, /module levelling, /module economy, /module logging, or /module counting /module automod.",
+        "Use /module-giveaways, /module-levelling, /module-economy, "
+        "/module-logging, /module-counting, or /module-automod.",
         inline=False
     )
 
     embed.add_field(
         name="Moderation and AutoMod commands",
         value=(
-            "`/purge` `module automod` `automod phrases add` `phrase list` `phrase remove` `automod log channel`"
+            "`/purge`, `/module-automod`, `/automod-phrases-add`, "
+            "`/automod-phrases-remove`, `/automod-phrases-list`, "
+            "`/automod-log-channel`."
         ),
         inline=False
     )
     embed.add_field(
-        name="/counting channel",
+        name="/counting-channel",
         value=(
             "Set a text channel for counting. Administrators only; "
             "1 channel per server, or 5 with Premium.\n"
-            "/counting channel remove"
+            "/counting-channel-remove"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="/log channel",
+        name="/log-channel",
         value="Choose the channel for edited and deleted message logs. Administrators only.\n"
-        "`log-exclude-channel` `log-channel-exclude-list`",
+        "`/log-exclude-channel`, `/log-channel-exclude-list`.",
         inline=False
     )
 
     embed.add_field(
-        name="/giveaway create",
+        name="/giveaway-create",
         value=(
             "Create a giveaway.\n"
             "Administrators only.\n"
@@ -7137,9 +7144,10 @@ async def admin_help_command(
     )
 
     embed.add_field(
-        name="/level channel exclude",
+        name="/level-channel-exclude",
         value="Add channels excluded from level experience. Administrators only.\n"
-        "`channel exclude remove` `channel exclude list` `level-set` `xp add` `xp remove`",
+        "`/level-channel-exclude-remove`, `/level-channel-exclude-list`, "
+        "`/level-set`, `/level-xp-add`, `/level-xp-remove`.",
         inline=False
     )
 
