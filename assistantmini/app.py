@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import discord
+import emoji as emoji_lib
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -2447,6 +2448,24 @@ def reaction_role_emoji_key(emoji: discord.PartialEmoji) -> str:
     return f"unicode:{emoji.name}"
 
 
+def parse_reaction_role_emoji(
+    emoji_text: str
+) -> discord.PartialEmoji | None:
+    if not emoji_text or any(character.isspace() for character in emoji_text):
+        return None
+
+    if emoji_text.startswith("<"):
+        emoji = discord.PartialEmoji.from_str(emoji_text)
+        if emoji.name and emoji.id is not None:
+            return emoji
+        return None
+
+    unicode_emoji = emoji_lib.emojize(emoji_text, language="alias")
+    if not emoji_lib.is_emoji(unicode_emoji):
+        return None
+    return discord.PartialEmoji(name=unicode_emoji)
+
+
 def create_reaction_role_embed(
     title: str,
     mappings: list[dict],
@@ -2541,7 +2560,7 @@ class ReactionRoleEmojiModal(discord.ui.Modal):
         self.setup_view = setup_view
         self.emoji_input = discord.ui.TextInput(
             label=f"Emoji {role_number}",
-            placeholder="Paste an emoji or enter <:name:id>",
+            placeholder="Paste an emoji, enter :red_circle:, or <:name:id>",
             max_length=100
         )
         self.add_item(self.emoji_input)
@@ -2559,14 +2578,11 @@ class ReactionRoleEmojiModal(discord.ui.Modal):
             return
 
         emoji_text = str(self.emoji_input.value).strip()
-        emoji = discord.PartialEmoji.from_str(emoji_text)
-        if (
-            not emoji.name
-            or any(character.isspace() for character in emoji_text)
-            or (emoji_text.startswith("<") and emoji.id is None)
-        ):
+        emoji = parse_reaction_role_emoji(emoji_text)
+        if emoji is None:
             await interaction.response.send_message(
-                "Enter one valid Unicode emoji or a custom emoji from this "
+                "Enter one valid Unicode emoji, an alias such as "
+                "`:red_circle:` or `:heart:`, or a custom emoji from this "
                 "server.",
                 ephemeral=True
             )
