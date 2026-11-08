@@ -83,6 +83,7 @@ MODULE_LABELS = {
     "counting": "Counting",
     "automod": "AutoMod",
     "reaction_roles": "Reaction Roles",
+    "autorole": "AutoRole",
 }
 MODULE_COMMANDS = {
     "giveaways": {
@@ -129,6 +130,11 @@ MODULE_COMMANDS = {
     "reaction_roles": {
         "reaction-role-new",
         "reaction-role-remove",
+    },
+    "autorole": {
+        "autorole-add",
+        "autorole-list",
+        "autorole-remove",
     },
 }
 COMMAND_MODULES = {
@@ -278,6 +284,7 @@ def get_default_server_settings():
         "streamer": None,
         "assistantmini_premium": False,
         "giveaway_role_entries": {},
+        "autoroles": [],
         "counting_channels": {},
         "automod_phrases": [],
         "automod_log_channel_id": None,
@@ -2148,6 +2155,59 @@ async def on_ready():
 
 
 @client.event
+async def on_member_join(member: discord.Member) -> None:
+    settings = get_server_settings(member.guild.id)
+    enabled = get_module_enabled(settings, "autorole")
+    if enabled is None:
+        print(
+            f"[AUTOROLE] Invalid module settings for guild "
+            f"{member.guild.id}; roles were not assigned."
+        )
+        return
+    if not enabled:
+        return
+
+    role_ids = get_autorole_ids(settings)
+    if role_ids is None:
+        print(
+            f"[AUTOROLE] Invalid saved role list for guild "
+            f"{member.guild.id}; roles were not assigned."
+        )
+        return
+
+    roles_to_assign = []
+    for role_id in role_ids:
+        role = member.guild.get_role(int(role_id))
+        if role is None:
+            print(
+                f"[AUTOROLE] Configured role {role_id} no longer exists in "
+                f"guild {member.guild.id}."
+            )
+        elif not role.is_assignable():
+            print(
+                f"[AUTOROLE] Cannot assign role {role.id} in guild "
+                f"{member.guild.id}; check the bot's Manage Roles permission "
+                "and role hierarchy."
+            )
+        elif role not in member.roles:
+            roles_to_assign.append(role)
+
+    if not roles_to_assign:
+        return
+
+    try:
+        await member.add_roles(
+            *roles_to_assign,
+            reason="AutoRole: member joined the server."
+        )
+    except discord.HTTPException as error:
+        print(
+            f"[AUTOROLE] Could not assign roles to member {member.id} in "
+            f"guild {member.guild.id}: {error}"
+        )
+
+
+@client.event
 async def on_entitlement_create(entitlement: discord.Entitlement):
     if entitlement.user_id is None:
         return
@@ -2430,6 +2490,38 @@ def save_reaction_role_messages(guild_id: int, messages: dict) -> bool:
     updated_settings = {
         **get_server_settings(guild_id),
         "reaction_role_messages": messages,
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return False
+
+    server_settings[guild_id_str] = updated_settings
+    return True
+
+
+def get_autorole_ids(settings) -> list[str] | None:
+    role_ids = settings.get("autoroles", [])
+    if (
+        not isinstance(role_ids, list)
+        or any(
+            not isinstance(role_id, str)
+            or not role_id.isdigit()
+            or len(role_id) > 20
+            for role_id in role_ids
+        )
+    ):
+        return None
+    return role_ids
+
+
+def save_autorole_ids(guild_id: int, role_ids: list[str]) -> bool:
+    guild_id_str = str(guild_id)
+    updated_settings = {
+        **get_server_settings(guild_id),
+        "autoroles": role_ids,
     }
     updated_server_settings = {
         **server_settings,
@@ -3094,6 +3186,206 @@ async def reaction_role_remove_command(
         f"Reaction Role message `{message_id}` was removed "
         f"({len(updated_messages)} message(s) remain).",
         ephemeral=True
+    )
+
+
+@client.tree.command(
+    name="autorole-add",
+    description="Give a role to members when they join this server."
+)
+@app_commands.describe(role="The role to assign to new members.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def autorole_add_command(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    if (
+        interaction.guild is None
+        or not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to configure AutoRole.",
+            ephemeral=True
+        )
+        return
+
+    if not role.is_assignable():
+        await interaction.response.send_message(
+            "I can't assign that role. Make sure it isn't managed and is "
+            "below my highest role, and that I have Manage Roles permission.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(interaction.guild.id)
+    role_ids = get_autorole_ids(settings)
+    if role_ids is None:
+        print(
+            f"[AUTOROLE] Invalid saved role list for guild "
+            f"{interaction.guild.id}."
+        )
+        await interaction.response.send_message(
+            "AutoRole's saved settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    role_id = str(role.id)
+    if role_id in role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is already assigned to new members.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    if not save_autorole_ids(interaction.guild.id, [*role_ids, role_id]):
+        await interaction.response.send_message(
+            "I couldn't save the AutoRole settings. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"New members will now receive {role.mention}.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@client.tree.command(
+    name="autorole-list",
+    description="List roles assigned automatically to new members."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def autorole_list_command(interaction: discord.Interaction):
+    if (
+        interaction.guild is None
+        or not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to view AutoRole settings.",
+            ephemeral=True
+        )
+        return
+
+    role_ids = get_autorole_ids(get_server_settings(interaction.guild.id))
+    if role_ids is None:
+        print(
+            f"[AUTOROLE] Invalid saved role list for guild "
+            f"{interaction.guild.id}."
+        )
+        await interaction.response.send_message(
+            "AutoRole's saved settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    if not role_ids:
+        await interaction.response.send_message(
+            "No AutoRoles are configured for this server.",
+            ephemeral=True
+        )
+        return
+
+    role_lines = []
+    for role_id in role_ids:
+        role = interaction.guild.get_role(int(role_id))
+        role_lines.append(
+            role.mention if role is not None else f"Deleted role ({role_id})"
+        )
+
+    page_size = 50
+    pages = [
+        role_lines[index:index + page_size]
+        for index in range(0, len(role_lines), page_size)
+    ]
+    for page_number, page in enumerate(pages, start=1):
+        embed = discord.Embed(
+            title="AutoRoles",
+            description="\n".join(page),
+            colour=discord.Colour(0xffffff)
+        )
+        if len(pages) > 1:
+            embed.set_footer(text=f"Page {page_number} of {len(pages)}")
+
+        if page_number == 1:
+            await interaction.response.send_message(
+                embed=embed,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        else:
+            await interaction.followup.send(
+                embed=embed,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+
+@client.tree.command(
+    name="autorole-remove",
+    description="Stop automatically assigning a role to new members."
+)
+@app_commands.describe(role="The role to stop assigning.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def autorole_remove_command(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    if (
+        interaction.guild is None
+        or not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to configure AutoRole.",
+            ephemeral=True
+        )
+        return
+
+    role_ids = get_autorole_ids(get_server_settings(interaction.guild.id))
+    if role_ids is None:
+        print(
+            f"[AUTOROLE] Invalid saved role list for guild "
+            f"{interaction.guild.id}."
+        )
+        await interaction.response.send_message(
+            "AutoRole's saved settings are invalid. Please contact support.",
+            ephemeral=True
+        )
+        return
+
+    role_id = str(role.id)
+    if role_id not in role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is not configured as an AutoRole.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    updated_role_ids = [
+        configured_role_id
+        for configured_role_id in role_ids
+        if configured_role_id != role_id
+    ]
+    if not save_autorole_ids(interaction.guild.id, updated_role_ids):
+        await interaction.response.send_message(
+            "I couldn't save the AutoRole settings. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"{role.mention} will no longer be assigned to new members.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
     )
 
 
@@ -7324,6 +7616,20 @@ async def module_reaction_roles_command(
     enabled: bool
 ):
     await set_module_enabled(interaction, "reaction_roles", enabled)
+
+
+@client.tree.command(
+    name="module-autorole",
+    description="Enable or disable the AutoRole module."
+)
+@app_commands.describe(enabled="Whether the AutoRole module is enabled.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def module_autorole_command(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    await set_module_enabled(interaction, "autorole", enabled)
 
 
 @client.tree.command(
