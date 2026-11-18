@@ -3282,9 +3282,7 @@ async def handle_reaction_role_setup_event(
         try:
             await session["message"].edit(
                 content=(
-                    "Reaction Role setup is complete. Members can react to "
-                    "receive the listed roles. If you reacted during setup, "
-                    "remove and re-add that reaction to receive its role."
+                    None
                     if is_complete
                     else reaction_role_setup_prompt(session)
                 ),
