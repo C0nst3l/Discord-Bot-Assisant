@@ -11,7 +11,6 @@ import uuid
 from pathlib import Path
 
 import discord
-import emoji as emoji_lib
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -2468,6 +2467,8 @@ async def counting_channel_remove_command(
 # ============================================================
 
 reaction_role_locks = {}
+reaction_role_setup_sessions: dict[int, dict] = {}
+REACTION_ROLE_SETUP_TIMEOUT = 15 * 60
 
 
 def get_reaction_role_messages(settings) -> dict | None:
@@ -2540,51 +2541,54 @@ def reaction_role_emoji_key(emoji: discord.PartialEmoji) -> str:
     return f"unicode:{emoji.name}"
 
 
-def parse_reaction_role_emoji(
-    emoji_text: str
-) -> discord.PartialEmoji | None:
-    if not emoji_text or any(character.isspace() for character in emoji_text):
-        return None
-
-    if emoji_text.startswith("<"):
-        emoji = discord.PartialEmoji.from_str(emoji_text)
-        if emoji.name and emoji.id is not None:
-            return emoji
-        return None
-
-    unicode_emoji = emoji_lib.emojize(emoji_text, language="alias")
-    if not emoji_lib.is_emoji(unicode_emoji):
-        return None
-    return discord.PartialEmoji(name=unicode_emoji)
-
-
 def create_reaction_role_embed(
     title: str,
+    custom_description: str,
     mappings: list[dict],
     guild_id: int,
-    preview: bool = False
+    role_ids: list[str] | None = None
 ) -> discord.Embed:
-    lines = ["Select the corresponding Emoji to gain the Roles!"]
-    if mappings:
-        lines.extend(
-            [
-                "",
-                *(
-                    f"{mapping['emoji']} - <@&{mapping['role_id']}>"
-                    for mapping in mappings
-                )
-            ]
+    mappings_by_role = {
+        mapping["role_id"]: mapping
+        for mapping in mappings
+    }
+    if role_ids is None:
+        role_ids = [
+            mapping["role_id"]
+            for mapping in mappings
+        ]
+
+    role_lines = [
+        f"{mappings_by_role[role_id]['emoji']} - <@&{role_id}>"
+        if role_id in mappings_by_role
+        else f"❔ - <@&{role_id}>"
+        for role_id in role_ids
+    ]
+    description_parts = []
+    if custom_description.strip():
+        description_parts.append(custom_description.strip())
+    else:
+        description_parts.append(
+            "Select the corresponding Emoji to gain the Roles!"
         )
-    elif preview:
-        lines.extend(["", "Choose a role, then enter its emoji below."])
+    if role_lines:
+        description_parts.append("\n".join(role_lines))
 
     embed = discord.Embed(
         title=title,
-        description="\n".join(lines),
+        description="\n\n".join(description_parts),
         colour=discord.Colour(0xffffff)
     )
     add_premium_footer(embed, guild_id)
     return embed
+
+
+def reaction_role_selection_prompt() -> str:
+    return (
+        "Choose roles one at a time in the order you want them shown. "
+        "Add another role, remove the last role, or set the title and "
+        "description to continue."
+    )
 
 
 class ReactionRoleRoleSelect(discord.ui.RoleSelect):
@@ -2592,7 +2596,7 @@ class ReactionRoleRoleSelect(discord.ui.RoleSelect):
     def __init__(self, setup_view):
         self.setup_view = setup_view
         super().__init__(
-            placeholder=f"Choose Role {len(setup_view.mappings) + 1}",
+            placeholder=f"Choose Role {len(setup_view.roles) + 1}",
             min_values=1,
             max_values=1,
             row=0
@@ -2611,8 +2615,8 @@ class ReactionRoleRoleSelect(discord.ui.RoleSelect):
             return
 
         if any(
-            mapping["role_id"] == str(role.id)
-            for mapping in self.setup_view.mappings
+            selected_role.id == role.id
+            for selected_role in self.setup_view.roles
         ):
             await interaction.response.send_message(
                 f"{role.mention} is already in this reaction role message.",
@@ -2623,7 +2627,9 @@ class ReactionRoleRoleSelect(discord.ui.RoleSelect):
         guild = interaction.guild
         bot_member = guild.me if guild is not None else None
         if (
-            bot_member is None
+            guild is None
+            or bot_member is None
+            or role.is_default()
             or role.managed
             or role >= bot_member.top_role
         ):
@@ -2634,170 +2640,165 @@ class ReactionRoleRoleSelect(discord.ui.RoleSelect):
             )
             return
 
-        self.setup_view.pending_role = role
+        selected_role_ids = [
+            str(selected_role.id)
+            for selected_role in self.setup_view.roles
+        ]
+        selected_role_ids.append(str(role.id))
+        role_list_description = create_reaction_role_embed(
+            "",
+            "",
+            [],
+            guild.id,
+            selected_role_ids
+        ).description
+        if (
+            role_list_description is None
+            or len(role_list_description) > 4096
+        ):
+            await interaction.response.send_message(
+                "The selected roles exceed Discord's 4,096-character embed "
+                "description limit. Remove some roles and try again.",
+                ephemeral=True
+            )
+            return
+
+        self.setup_view.roles.append(role)
+        self.setup_view.remove_role_button.disabled = False
+        self.setup_view.details_button.disabled = False
+        self.placeholder = f"Choose Role {len(self.setup_view.roles) + 1}"
         await interaction.response.edit_message(
-            content=(
-                f"Selected {role.mention}. Enter its emoji, then choose "
-                "another role or publish the message."
-            ),
+            content=reaction_role_selection_prompt(),
+            embed=self.setup_view.selection_embed(),
+            allowed_mentions=discord.AllowedMentions.none(),
             view=self.setup_view
         )
 
 
-class ReactionRoleEmojiModal(discord.ui.Modal):
+class ReactionRoleDetailsModal(discord.ui.Modal):
 
     def __init__(self, setup_view):
-        role_number = len(setup_view.mappings) + 1
-        super().__init__(title=f"Enter Emoji {role_number}")
+        super().__init__(title="Reaction Role Details")
         self.setup_view = setup_view
-        self.emoji_input = discord.ui.TextInput(
-            label=f"Emoji {role_number}",
-            placeholder="Paste an emoji, enter :red_circle:, or <:name:id>",
-            max_length=100
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="Enter the title for this Reaction Role message",
+            max_length=256
         )
-        self.add_item(self.emoji_input)
+        self.description_input = discord.ui.TextInput(
+            label="Description above the role list",
+            placeholder="Optional description shown above the role list",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=4000
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await self.setup_view.verify_admin(interaction):
             return
 
-        role = self.setup_view.pending_role
-        if role is None:
+        title = str(self.title_input.value).strip()
+        if not title:
             await interaction.response.send_message(
-                "Choose a role before entering its emoji.",
+                "The title must contain between 1 and 256 characters.",
                 ephemeral=True
             )
             return
 
-        emoji_text = str(self.emoji_input.value).strip()
-        emoji = parse_reaction_role_emoji(emoji_text)
-        if emoji is None:
-            await interaction.response.send_message(
-                "Enter one valid Unicode emoji, an alias such as "
-                "`:red_circle:` or `:heart:`, or a custom emoji from this "
-                "server.",
-                ephemeral=True
-            )
-            return
-
-        emoji_key = reaction_role_emoji_key(emoji)
-        emoji_keys = {
-            mapping["emoji_key"]
-            for mapping in self.setup_view.mappings
-        }
-        if (
-            emoji_key not in emoji_keys
-            and len(emoji_keys) >= MAX_REACTIONS_PER_MESSAGE
-        ):
-            await interaction.response.send_message(
-                "Discord allows up to 20 different reactions on one message. "
-                "Use an emoji already in this message or remove a mapping.",
-                ephemeral=True
-            )
-            return
-
-        mapping = {
-            "emoji": str(emoji),
-            "emoji_key": emoji_key,
-            "role_id": str(role.id),
-        }
-        updated_mappings = [*self.setup_view.mappings, mapping]
         description = create_reaction_role_embed(
-            self.setup_view.title,
-            updated_mappings,
-            self.setup_view.guild_id
+            title,
+            str(self.description_input.value),
+            [],
+            self.setup_view.guild_id,
+            [str(role.id) for role in self.setup_view.roles]
         ).description
         if description is None or len(description) > 4096:
             await interaction.response.send_message(
-                "The role list is too long for a Discord embed description. "
-                "Use shorter role names or fewer mappings.",
+                "The description and selected role list exceed Discord's "
+                "4,096-character embed limit. Shorten the description or "
+                "remove some roles, then try again.",
                 ephemeral=True
             )
             return
 
-        self.setup_view.mappings.append(mapping)
-        self.setup_view.pending_role = None
-        self.setup_view.publish_button.disabled = False
-        for item in self.setup_view.children:
-            if isinstance(item, ReactionRoleRoleSelect):
-                item.placeholder = (
-                    f"Choose Role {len(self.setup_view.mappings) + 1}"
-                )
-            elif isinstance(item, ReactionRoleEmojiButton):
-                item.label = (
-                    f"Enter Emoji {len(self.setup_view.mappings) + 1}"
-                )
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await self.setup_view.setup_message.edit(
-                content=(
-                    f"Added {emoji} — {role.mention}. Select another role "
-                    "to continue, or publish when ready."
-                ),
-                embed=self.setup_view.preview_embed(),
-                view=self.setup_view
-            )
-        except discord.HTTPException as error:
-            print(
-                f"[REACTION ROLES] Could not update the setup message for "
-                f"guild {self.setup_view.guild_id}: {error}"
-            )
-            await interaction.followup.send(
-                "The mapping was added, but I couldn't refresh the setup "
-                "message. Run /reaction-role-new again if it is no longer "
-                "available.",
-                ephemeral=True
-            )
-            return
-        await interaction.followup.send(
-            f"Added {emoji} — {role.mention}.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none()
+        await self.setup_view.publish(
+            interaction,
+            title,
+            str(self.description_input.value).strip()
         )
 
 
-class ReactionRoleEmojiButton(discord.ui.Button):
+class ReactionRoleRemoveLastButton(discord.ui.Button):
 
     def __init__(self, setup_view):
         self.setup_view = setup_view
         super().__init__(
-            label=f"Enter Emoji {len(setup_view.mappings) + 1}",
-            style=discord.ButtonStyle.primary,
+            label="Remove Last Role",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
             row=1
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not await self.setup_view.verify_admin(interaction):
             return
-        if self.setup_view.pending_role is None:
+        if not self.setup_view.roles:
             await interaction.response.send_message(
-                "Choose a role from the dropdown first.",
+                "There are no selected roles to remove.",
                 ephemeral=True
             )
             return
-        await interaction.response.send_modal(
-            ReactionRoleEmojiModal(self.setup_view)
+
+        removed_role = self.setup_view.roles.pop()
+        role_select = next(
+            item
+            for item in self.setup_view.children
+            if isinstance(item, ReactionRoleRoleSelect)
+        )
+        role_select.placeholder = f"Choose Role {len(self.setup_view.roles) + 1}"
+        self.disabled = not self.setup_view.roles
+        self.setup_view.details_button.disabled = not self.setup_view.roles
+        await interaction.response.edit_message(
+            content=(
+                f"Removed {removed_role.mention}.\n\n"
+                f"{reaction_role_selection_prompt()}"
+            ),
+            embed=self.setup_view.selection_embed(),
+            allowed_mentions=discord.AllowedMentions.none(),
+            view=self.setup_view
         )
 
 
-class ReactionRolePublishButton(discord.ui.Button):
+class ReactionRoleDetailsButton(discord.ui.Button):
 
     def __init__(self, setup_view):
         self.setup_view = setup_view
         super().__init__(
-            label="Publish",
+            label="Set Title & Description",
             style=discord.ButtonStyle.success,
             disabled=True,
             row=1
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self.setup_view.publish(interaction)
+        if not await self.setup_view.verify_admin(interaction):
+            return
+        if not self.setup_view.roles:
+            await interaction.response.send_message(
+                "Choose at least one role first.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            ReactionRoleDetailsModal(self.setup_view)
+        )
 
 
 class ReactionRoleSetupView(discord.ui.View):
 
-    def __init__(self, interaction: discord.Interaction, title: str):
+    def __init__(self, interaction: discord.Interaction):
         super().__init__(timeout=15 * 60)
         guild = interaction.guild
         if guild is None:
@@ -2805,21 +2806,24 @@ class ReactionRoleSetupView(discord.ui.View):
         self.guild_id = guild.id
         self.channel = interaction.channel
         self.requester_id = interaction.user.id
-        self.title = title.strip()
-        self.mappings = []
-        self.pending_role = None
+        self.roles = []
         self.setup_message: discord.InteractionMessage | None = None
-        self.publish_button = ReactionRolePublishButton(self)
+        self.remove_role_button = ReactionRoleRemoveLastButton(self)
+        self.details_button = ReactionRoleDetailsButton(self)
         self.add_item(ReactionRoleRoleSelect(self))
-        self.add_item(ReactionRoleEmojiButton(self))
-        self.add_item(self.publish_button)
+        self.add_item(self.remove_role_button)
+        self.add_item(self.details_button)
 
-    def preview_embed(self) -> discord.Embed:
-        return create_reaction_role_embed(
-            self.title,
-            self.mappings,
-            self.guild_id,
-            preview=True
+    def selection_embed(self) -> discord.Embed:
+        description = (
+            "Selected roles in order:\n"
+            + "\n".join(role.mention for role in self.roles)
+            if self.roles
+            else "No roles selected yet."
+        )
+        return discord.Embed(
+            description=description,
+            colour=discord.Colour(0xffffff)
         )
 
     async def verify_admin(
@@ -2840,7 +2844,12 @@ class ReactionRoleSetupView(discord.ui.View):
         )
         return False
 
-    async def publish(self, interaction: discord.Interaction) -> None:
+    async def publish(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str
+    ) -> None:
         if not await self.verify_admin(interaction):
             return
 
@@ -2874,27 +2883,27 @@ class ReactionRoleSetupView(discord.ui.View):
         if (
             not can_send_messages
             or not permissions.embed_links
-            or not permissions.add_reactions
+            or not permissions.read_message_history
             or not permissions.manage_roles
         ):
             await interaction.response.send_message(
-                "I need permission to send messages, embed links, add "
-                "reactions, and manage roles in this channel.",
+                "I need permission to send messages, embed links, read "
+                "message history, and manage roles in this channel.",
                 ephemeral=True
             )
             return
 
-        if not self.mappings:
+        if not self.roles:
             await interaction.response.send_message(
-                "Add at least one role and emoji before publishing.",
+                "Choose at least one role before continuing.",
                 ephemeral=True
             )
             return
 
-        for mapping in self.mappings:
-            role = guild.get_role(int(mapping["role_id"]))
+        for role in self.roles:
             if (
-                role is None
+                guild.get_role(role.id) is None
+                or role.is_default()
                 or role.managed
                 or role >= bot_member.top_role
             ):
@@ -2904,6 +2913,23 @@ class ReactionRoleSetupView(discord.ui.View):
                     ephemeral=True
                 )
                 return
+
+        role_ids = [str(role.id) for role in self.roles]
+        embed = create_reaction_role_embed(
+            title,
+            description,
+            [],
+            guild.id,
+            role_ids
+        )
+        if embed.description is None or len(embed.description) > 4096:
+            await interaction.response.send_message(
+                "The description and selected role list exceed Discord's "
+                "4,096-character embed limit. Shorten the description or "
+                "remove some roles, then try again.",
+                ephemeral=True
+            )
+            return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         lock = reaction_role_locks.setdefault(guild.id, asyncio.Lock())
@@ -2922,12 +2948,16 @@ class ReactionRoleSetupView(discord.ui.View):
                 )
                 return
 
+            active_setup_count = sum(
+                session["guild_id"] == guild.id
+                for session in reaction_role_setup_sessions.values()
+            )
             limit = (
                 PREMIUM_MAX_REACTION_ROLE_MESSAGES
                 if settings.get("assistantmini_premium") is True
                 else MAX_REACTION_ROLE_MESSAGES
             )
-            if len(messages) >= limit:
+            if len(messages) + active_setup_count >= limit:
                 await interaction.followup.send(
                     f"This server has reached its limit of {limit} Reaction "
                     "Role messages. Remove one with /reaction-role-remove "
@@ -2936,13 +2966,16 @@ class ReactionRoleSetupView(discord.ui.View):
                 )
                 return
 
-            embed = create_reaction_role_embed(
-                self.title,
-                self.mappings,
-                guild.id
+            current_role = self.roles[0]
+            prompt = (
+                f"Now react to this message with the desired emoji for "
+                f"{current_role.mention}.\n"
+                "If reusing an emoji already on this message, remove your "
+                "reaction first and add it again."
             )
             try:
                 message = await channel.send(
+                    content=prompt,
                     embed=embed,
                     allowed_mentions=discord.AllowedMentions.none()
                 )
@@ -2958,82 +2991,332 @@ class ReactionRoleSetupView(discord.ui.View):
                 )
                 return
 
-            updated_messages = {
-                **messages,
-                str(message.id): {
-                    "channel_id": str(channel.id),
-                    "title": self.title,
-                    "mappings": self.mappings,
-                },
+            session = {
+                "guild_id": guild.id,
+                "requester_id": self.requester_id,
+                "channel": channel,
+                "message": message,
+                "title": title,
+                "description": description,
+                "role_ids": role_ids,
+                "mappings": [],
+                "next_role_index": 0,
+                "requester_reacted_keys": set(),
+                "early_reactions": {},
+                "lock": asyncio.Lock(),
             }
-            if not save_reaction_role_messages(guild.id, updated_messages):
-                try:
-                    await message.delete()
-                except discord.HTTPException as error:
-                    print(
-                        f"[REACTION ROLES] Could not remove unregistered "
-                        f"message {message.id}: {error}"
-                    )
-                await interaction.followup.send(
-                    "I couldn't save this Reaction Role message, so it "
-                    "cannot assign roles. Please try again.",
-                    ephemeral=True
-                )
-                return
-
-            added_emoji_keys = set()
-            try:
-                for mapping in self.mappings:
-                    if mapping["emoji_key"] in added_emoji_keys:
-                        continue
-                    await message.add_reaction(
-                        discord.PartialEmoji.from_str(mapping["emoji"])
-                    )
-                    added_emoji_keys.add(mapping["emoji_key"])
-            except discord.HTTPException as error:
-                print(
-                    f"[REACTION ROLES] Could not add a reaction to message "
-                    f"{message.id}: {error}"
-                )
-                try:
-                    await message.delete()
-                except discord.HTTPException as delete_error:
-                    print(
-                        f"[REACTION ROLES] Could not remove incomplete "
-                        f"message {message.id}: {delete_error}"
-                    )
-                if not save_reaction_role_messages(guild.id, messages):
-                    print(
-                        f"[REACTION ROLES] Could not unregister incomplete "
-                        f"message {message.id} in guild {guild.id}."
-                    )
-                await interaction.followup.send(
-                    "I couldn't add all the requested reactions, so the "
-                    "message was not registered. Verify the emojis and my "
-                    "permissions, then try again.",
-                    ephemeral=True
-                )
-                return
+            reaction_role_setup_sessions[message.id] = session
+            asyncio.create_task(
+                expire_reaction_role_setup(message.id)
+            )
 
         self.stop()
+        if self.setup_message is not None:
+            try:
+                await self.setup_message.edit(
+                    content=(
+                        f"Emoji setup started in {channel.mention}. "
+                        "Continue in the posted message."
+                    ),
+                    embed=None,
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not close the setup controls "
+                    f"for guild {guild.id}: {error}"
+                )
         await interaction.followup.send(
-            f"Reaction Role message published in {channel.mention} "
-            f"({len(updated_messages)}/{limit} messages configured).",
+            f"Posted the emoji setup message in {channel.mention}. React to "
+            "it with the emoji for each role in order; the completed message "
+            "will then be registered.",
             ephemeral=True
         )
 
 
+async def expire_reaction_role_setup(message_id: int) -> None:
+    await asyncio.sleep(REACTION_ROLE_SETUP_TIMEOUT)
+    session = reaction_role_setup_sessions.get(message_id)
+    if session is None:
+        return
+
+    async with session["lock"]:
+        if reaction_role_setup_sessions.get(message_id) is not session:
+            return
+        reaction_role_setup_sessions.pop(message_id, None)
+        try:
+            await session["message"].delete()
+        except discord.NotFound:
+            return
+        except discord.HTTPException as error:
+            print(
+                f"[REACTION ROLES] Could not delete expired setup message "
+                f"{message_id}: {error}"
+            )
+            try:
+                await session["message"].edit(
+                    content="This Reaction Role setup expired. Run "
+                    "/reaction-role-new to start again.",
+                    embed=None,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as edit_error:
+                print(
+                    f"[REACTION ROLES] Could not mark expired setup message "
+                    f"{message_id}: {edit_error}"
+                )
+
+
+def reaction_role_setup_prompt(session: dict) -> str:
+    role_id = session["role_ids"][session["next_role_index"]]
+    return (
+        f"Now react to this message with the desired emoji for "
+        f"<@&{role_id}>.\n"
+        "If reusing an emoji already on this message, remove your reaction "
+        "first and add it again."
+    )
+
+
+async def register_reaction_role_setup(session: dict) -> bool:
+    guild_id = session["guild_id"]
+    lock = reaction_role_locks.setdefault(guild_id, asyncio.Lock())
+    async with lock:
+        settings = get_server_settings(guild_id)
+        messages = get_reaction_role_messages(settings)
+        if messages is None:
+            print(
+                f"[REACTION ROLES] Invalid saved message settings for guild "
+                f"{guild_id}; completed setup was not registered."
+            )
+            return False
+
+        limit = (
+            PREMIUM_MAX_REACTION_ROLE_MESSAGES
+            if settings.get("assistantmini_premium") is True
+            else MAX_REACTION_ROLE_MESSAGES
+        )
+        if len(messages) >= limit:
+            print(
+                f"[REACTION ROLES] Message limit reached for guild "
+                f"{guild_id}; completed setup was not registered."
+            )
+            return False
+
+        message = session["message"]
+        updated_messages = {
+            **messages,
+            str(message.id): {
+                "channel_id": str(session["channel"].id),
+                "title": session["title"],
+                "description": session["description"],
+                "mappings": session["mappings"],
+                "setup_reaction_user_id": str(session["requester_id"]),
+                "setup_reaction_keys": sorted(
+                    session["requester_reacted_keys"]
+                ),
+            },
+        }
+        if not save_reaction_role_messages(guild_id, updated_messages):
+            print(
+                f"[REACTION ROLES] Could not save completed setup message "
+                f"{message.id} in guild {guild_id}."
+            )
+            return False
+    return True
+
+
+async def handle_reaction_role_setup_event(
+    payload: discord.RawReactionActionEvent,
+    add_reaction: bool
+) -> bool:
+    session = reaction_role_setup_sessions.get(payload.message_id)
+    if session is None:
+        return False
+
+    async with session["lock"]:
+        if reaction_role_setup_sessions.get(payload.message_id) is not session:
+            return True
+        emoji_key = reaction_role_emoji_key(payload.emoji)
+        if payload.user_id != session["requester_id"]:
+            if client.user is None or payload.user_id != client.user.id:
+                reacting_users = session["early_reactions"].setdefault(
+                    emoji_key,
+                    set()
+                )
+                if add_reaction:
+                    reacting_users.add(payload.user_id)
+                else:
+                    reacting_users.discard(payload.user_id)
+                    if not reacting_users:
+                        session["early_reactions"].pop(emoji_key, None)
+            return True
+
+        if not add_reaction:
+            session["requester_reacted_keys"].discard(emoji_key)
+            return True
+
+        if session["next_role_index"] >= len(session["role_ids"]):
+            return True
+
+        used_emoji_keys = {
+            mapping["emoji_key"]
+            for mapping in session["mappings"]
+        }
+        used_emoji_keys.update(session["early_reactions"])
+        if (
+            emoji_key not in used_emoji_keys
+            and len(used_emoji_keys) >= MAX_REACTIONS_PER_MESSAGE
+        ):
+            try:
+                await session["message"].edit(
+                    content=(
+                        reaction_role_setup_prompt(session)
+                        + "\nThis message already has 20 different emojis. "
+                        "Choose one that is already on the message."
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not update setup message "
+                    f"{payload.message_id}: {error}"
+                )
+            return True
+
+        role_id = session["role_ids"][session["next_role_index"]]
+        mapping = {
+            "emoji": str(payload.emoji),
+            "emoji_key": emoji_key,
+            "role_id": role_id,
+        }
+        updated_mappings = [*session["mappings"], mapping]
+        embed = create_reaction_role_embed(
+            session["title"],
+            session["description"],
+            updated_mappings,
+            session["guild_id"],
+            session["role_ids"]
+        )
+        if embed.description is None or len(embed.description) > 4096:
+            try:
+                await session["message"].edit(
+                    content=(
+                        reaction_role_setup_prompt(session)
+                        + "\nThat emoji would exceed the embed description "
+                        "limit. Choose a shorter emoji."
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not update setup message "
+                    f"{payload.message_id}: {error}"
+                )
+            return True
+
+        session["mappings"].append(mapping)
+        session["next_role_index"] += 1
+        session["requester_reacted_keys"].add(emoji_key)
+        is_complete = (
+            session["next_role_index"] == len(session["role_ids"])
+        )
+        if is_complete and not await register_reaction_role_setup(session):
+            reaction_role_setup_sessions.pop(payload.message_id, None)
+            try:
+                await session["message"].delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not delete unregistered setup "
+                    f"message {payload.message_id}: {error}"
+                )
+                try:
+                    await session["message"].edit(
+                        content=(
+                            "Setup failed while saving. This message does "
+                            "not assign roles; run /reaction-role-new again."
+                        ),
+                        embed=None,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+                except discord.HTTPException as edit_error:
+                    print(
+                        f"[REACTION ROLES] Could not mark failed setup "
+                        f"message {payload.message_id}: {edit_error}"
+                    )
+            return True
+
+        if is_complete:
+            guild = session["message"].guild
+            role_ids_by_emoji: dict[str, set[str]] = {}
+            for role_mapping in session["mappings"]:
+                role_ids_by_emoji.setdefault(
+                    role_mapping["emoji_key"],
+                    set()
+                ).add(role_mapping["role_id"])
+            if guild is not None:
+                for early_emoji_key, reacting_users in session[
+                    "early_reactions"
+                ].items():
+                    early_role_ids = role_ids_by_emoji.get(early_emoji_key)
+                    if not early_role_ids:
+                        continue
+                    for user_id in reacting_users:
+                        await update_reaction_role_member(
+                            guild,
+                            user_id,
+                            early_role_ids,
+                            True
+                        )
+            else:
+                print(
+                    f"[REACTION ROLES] Could not resolve guild for setup "
+                    f"message {payload.message_id}; early reactions were "
+                    "not assigned."
+                )
+
+        if is_complete:
+            reaction_role_setup_sessions.pop(payload.message_id, None)
+        try:
+            await session["message"].edit(
+                content=(
+                    "Reaction Role setup is complete. Members can react to "
+                    "receive the listed roles. If you reacted during setup, "
+                    "remove and re-add that reaction to receive its role."
+                    if is_complete
+                    else reaction_role_setup_prompt(session)
+                ),
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException as error:
+            print(
+                f"[REACTION ROLES] Could not update setup message "
+                f"{payload.message_id}: {error}"
+            )
+            if not is_complete:
+                reaction_role_setup_sessions.pop(payload.message_id, None)
+                try:
+                    await session["message"].delete()
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException as delete_error:
+                    print(
+                        f"[REACTION ROLES] Could not delete incomplete setup "
+                        f"message {payload.message_id}: {delete_error}"
+                    )
+    return True
+
+
 @client.tree.command(
     name="reaction-role-new",
-    description="Create a message that assigns roles when members react."
+    description="Create a reaction role message with a custom title and description."
 )
-@app_commands.describe(title="The title shown on the Reaction Role embed.")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def reaction_role_new_command(
-    interaction: discord.Interaction,
-    title: str
-):
+async def reaction_role_new_command(interaction: discord.Interaction):
     if (
         interaction.guild is None
         or not isinstance(interaction.user, discord.Member)
@@ -3046,21 +3329,10 @@ async def reaction_role_new_command(
         )
         return
 
-    title = title.strip()
-    if not title or len(title) > 256:
-        await interaction.response.send_message(
-            "The title must contain between 1 and 256 characters.",
-            ephemeral=True
-        )
-        return
-
-    view = ReactionRoleSetupView(interaction, title)
+    view = ReactionRoleSetupView(interaction)
     await interaction.response.send_message(
-        content=(
-            "Choose a role, enter its emoji, and repeat as needed. "
-            "Publish when your list is ready."
-        ),
-        embed=view.preview_embed(),
+        content=reaction_role_selection_prompt(),
+        embed=view.selection_embed(),
         view=view,
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none()
@@ -3398,15 +3670,6 @@ async def handle_reaction_role_event(
         return
 
     settings = get_server_settings(guild.id)
-    enabled = get_module_enabled(settings, "reaction_roles")
-    if enabled is not True:
-        if enabled is None:
-            print(
-                f"[REACTION ROLES] Invalid module settings for guild "
-                f"{guild.id}; reaction was ignored."
-            )
-        return
-
     messages = get_reaction_role_messages(settings)
     if messages is None:
         print(
@@ -3418,6 +3681,25 @@ async def handle_reaction_role_event(
     entry = messages.get(str(payload.message_id))
     if not isinstance(entry, dict):
         return
+
+    emoji_key = reaction_role_emoji_key(payload.emoji)
+    if not add_role and await consume_reaction_role_setup_reaction(
+        guild.id,
+        payload.message_id,
+        payload.user_id,
+        emoji_key
+    ):
+        return
+
+    enabled = get_module_enabled(settings, "reaction_roles")
+    if enabled is not True:
+        if enabled is None:
+            print(
+                f"[REACTION ROLES] Invalid module settings for guild "
+                f"{guild.id}; reaction was ignored."
+            )
+        return
+
     mappings = entry.get("mappings")
     if not isinstance(mappings, list):
         print(
@@ -3426,7 +3708,6 @@ async def handle_reaction_role_event(
         )
         return
 
-    emoji_key = reaction_role_emoji_key(payload.emoji)
     role_ids: set[str] = set()
     for mapping in mappings:
         if (
@@ -3439,19 +3720,32 @@ async def handle_reaction_role_event(
     if not role_ids:
         return
 
-    member = (
-        payload.member
-        if add_role and isinstance(payload.member, discord.Member)
-        else guild.get_member(payload.user_id)
+    await update_reaction_role_member(
+        guild,
+        payload.user_id,
+        role_ids,
+        add_role,
+        payload.member if isinstance(payload.member, discord.Member) else None
     )
+
+
+async def update_reaction_role_member(
+    guild: discord.Guild,
+    user_id: int,
+    role_ids: set[str],
+    add_role: bool,
+    member: discord.Member | None = None
+) -> None:
+    if not add_role or member is None:
+        member = guild.get_member(user_id)
     if member is None:
         try:
-            member = await guild.fetch_member(payload.user_id)
+            member = await guild.fetch_member(user_id)
         except discord.NotFound:
             return
         except discord.HTTPException as error:
             print(
-                f"[REACTION ROLES] Could not find member {payload.user_id} "
+                f"[REACTION ROLES] Could not find member {user_id} "
                 f"in guild {guild.id}: {error}"
             )
             return
@@ -3479,10 +3773,62 @@ async def handle_reaction_role_event(
             )
 
 
+async def consume_reaction_role_setup_reaction(
+    guild_id: int,
+    message_id: int,
+    user_id: int,
+    emoji_key: str
+) -> bool:
+    lock = reaction_role_locks.setdefault(guild_id, asyncio.Lock())
+    async with lock:
+        settings = get_server_settings(guild_id)
+        messages = get_reaction_role_messages(settings)
+        if messages is None:
+            print(
+                f"[REACTION ROLES] Invalid saved message settings for guild "
+                f"{guild_id}; setup reaction could not be checked."
+            )
+            return False
+
+        message_id_str = str(message_id)
+        entry = messages.get(message_id_str)
+        if not isinstance(entry, dict):
+            return False
+        setup_user_id = entry.get("setup_reaction_user_id")
+        setup_reaction_keys = entry.get("setup_reaction_keys")
+        if (
+            setup_user_id != str(user_id)
+            or not isinstance(setup_reaction_keys, list)
+            or emoji_key not in setup_reaction_keys
+        ):
+            return False
+
+        updated_entry = {
+            **entry,
+            "setup_reaction_keys": [
+                key
+                for key in setup_reaction_keys
+                if key != emoji_key
+            ],
+        }
+        updated_messages = {
+            **messages,
+            message_id_str: updated_entry,
+        }
+        if not save_reaction_role_messages(guild_id, updated_messages):
+            print(
+                f"[REACTION ROLES] Could not clear setup reaction state for "
+                f"message {message_id} in guild {guild_id}."
+            )
+        return True
+
+
 @client.event
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent
 ) -> None:
+    if await handle_reaction_role_setup_event(payload, True):
+        return
     await handle_reaction_role_event(payload, True)
 
 
@@ -3490,6 +3836,8 @@ async def on_raw_reaction_add(
 async def on_raw_reaction_remove(
     payload: discord.RawReactionActionEvent
 ) -> None:
+    if await handle_reaction_role_setup_event(payload, False):
+        return
     await handle_reaction_role_event(payload, False)
 
 
@@ -8286,9 +8634,10 @@ async def admin_help_command(
     embed.add_field(
         name="/reaction-role-new",
         value=(
-            "Create an embedded reaction-role message in the current channel. "
-            "Administrators only; 10 messages per server, or 20 with "
-            "Premium. Use /reaction-role-remove to delete one and free a slot."
+            "Select roles in order, then use a modal to set the title and "
+            "custom description. React to the posted prompt with an emoji "
+            "for each role. Administrators only; 10 messages per server, or "
+            "20 with Premium. Use /reaction-role-remove to delete one."
         ),
         inline=False
     )
@@ -8469,6 +8818,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     if payload.guild_id is None:
         return
 
+    reaction_role_setup_sessions.pop(payload.message_id, None)
     guild = client.get_guild(payload.guild_id)
     if guild is None:
         return
