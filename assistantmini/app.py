@@ -2468,6 +2468,8 @@ async def counting_channel_remove_command(
 
 reaction_role_locks = {}
 reaction_role_setup_sessions: dict[int, dict] = {}
+reaction_role_user_selection_locks: dict[tuple[int, int], asyncio.Lock] = {}
+reaction_role_user_selections: dict[tuple[int, int], str] = {}
 REACTION_ROLE_SETUP_TIMEOUT = 15 * 60
 
 
@@ -2535,7 +2537,11 @@ def save_autorole_ids(guild_id: int, role_ids: list[str]) -> bool:
     return True
 
 
-def reaction_role_emoji_key(emoji: discord.PartialEmoji) -> str:
+def reaction_role_emoji_key(
+    emoji: discord.PartialEmoji | discord.Emoji | str
+) -> str:
+    if isinstance(emoji, str):
+        return f"unicode:{emoji}"
     if emoji.id is not None:
         return f"custom:{emoji.id}"
     return f"unicode:{emoji.name}"
@@ -2796,6 +2802,55 @@ class ReactionRoleDetailsButton(discord.ui.Button):
         )
 
 
+class ReactionRoleModeSelect(discord.ui.Select):
+
+    def __init__(self, setup_view):
+        self.setup_view = setup_view
+        super().__init__(
+            placeholder="Choose how members can select roles",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Multiple roles",
+                    value="multiple",
+                    description="Members can choose any number of roles.",
+                    default=True
+                ),
+                discord.SelectOption(
+                    label="One role only",
+                    value="single",
+                    description=(
+                        "A new choice removes the member's previous reaction."
+                    )
+                ),
+            ],
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.setup_view.verify_admin(interaction):
+            return
+
+        self.setup_view.selection_mode = self.values[0]
+        for option in self.options:
+            option.default = option.value == self.setup_view.selection_mode
+        await interaction.response.edit_message(
+            content=(
+                f"{reaction_role_selection_prompt()}\n\n"
+                "Role selection mode: **"
+                + (
+                    "One role only"
+                    if self.setup_view.selection_mode == "single"
+                    else "Multiple roles"
+                )
+                + "**."
+            ),
+            embed=self.setup_view.selection_embed(),
+            view=self.setup_view
+        )
+
+
 class ReactionRoleSetupView(discord.ui.View):
 
     def __init__(self, interaction: discord.Interaction):
@@ -2807,12 +2862,14 @@ class ReactionRoleSetupView(discord.ui.View):
         self.channel = interaction.channel
         self.requester_id = interaction.user.id
         self.roles = []
+        self.selection_mode = "multiple"
         self.setup_message: discord.InteractionMessage | None = None
         self.remove_role_button = ReactionRoleRemoveLastButton(self)
         self.details_button = ReactionRoleDetailsButton(self)
         self.add_item(ReactionRoleRoleSelect(self))
         self.add_item(self.remove_role_button)
         self.add_item(self.details_button)
+        self.add_item(ReactionRoleModeSelect(self))
 
     def selection_embed(self) -> discord.Embed:
         description = (
@@ -2821,10 +2878,20 @@ class ReactionRoleSetupView(discord.ui.View):
             if self.roles
             else "No roles selected yet."
         )
-        return discord.Embed(
+        embed = discord.Embed(
             description=description,
             colour=discord.Colour(0xffffff)
         )
+        embed.add_field(
+            name="Role selection",
+            value=(
+                "One role only"
+                if self.selection_mode == "single"
+                else "Multiple roles"
+            ),
+            inline=False
+        )
+        return embed
 
     async def verify_admin(
         self,
@@ -2885,10 +2952,20 @@ class ReactionRoleSetupView(discord.ui.View):
             or not permissions.embed_links
             or not permissions.read_message_history
             or not permissions.manage_roles
+            or (
+                self.selection_mode == "single"
+                and not permissions.manage_messages
+            )
         ):
             await interaction.response.send_message(
                 "I need permission to send messages, embed links, read "
-                "message history, and manage roles in this channel.",
+                "message history, and manage roles in this channel. "
+                + (
+                    "One-role mode also requires Manage Messages."
+                    if self.selection_mode == "single"
+                    and not permissions.manage_messages
+                    else ""
+                ),
                 ephemeral=True
             )
             return
@@ -2970,8 +3047,14 @@ class ReactionRoleSetupView(discord.ui.View):
             prompt = (
                 f"Now react to this message with the desired emoji for "
                 f"{current_role.mention}.\n"
-                "If reusing an emoji already on this message, remove your "
-                "reaction first and add it again."
+            )
+            prompt += (
+                "Use a unique emoji for each role."
+                if self.selection_mode == "single"
+                else (
+                    "If reusing an emoji already on this message, remove "
+                    "your reaction first and add it again."
+                )
             )
             try:
                 message = await channel.send(
@@ -2998,6 +3081,7 @@ class ReactionRoleSetupView(discord.ui.View):
                 "message": message,
                 "title": title,
                 "description": description,
+                "selection_mode": self.selection_mode,
                 "role_ids": role_ids,
                 "mappings": [],
                 "next_role_index": 0,
@@ -3030,7 +3114,8 @@ class ReactionRoleSetupView(discord.ui.View):
         await interaction.followup.send(
             f"Posted the emoji setup message in {channel.mention}. React to "
             "it with the emoji for each role in order; the completed message "
-            "will then be registered.",
+            "will then be registered. Selection mode: "
+            f"{'one role only' if self.selection_mode == 'single' else 'multiple roles'}.",
             ephemeral=True
         )
 
@@ -3070,11 +3155,17 @@ async def expire_reaction_role_setup(message_id: int) -> None:
 
 def reaction_role_setup_prompt(session: dict) -> str:
     role_id = session["role_ids"][session["next_role_index"]]
-    return (
+    prompt = (
         f"Now react to this message with the desired emoji for "
         f"<@&{role_id}>.\n"
-        "If reusing an emoji already on this message, remove your reaction "
-        "first and add it again."
+    )
+    return prompt + (
+        "Use a unique emoji for each role."
+        if session.get("selection_mode") == "single"
+        else (
+            "If reusing an emoji already on this message, remove your "
+            "reaction first and add it again."
+        )
     )
 
 
@@ -3110,6 +3201,7 @@ async def register_reaction_role_setup(session: dict) -> bool:
                 "channel_id": str(session["channel"].id),
                 "title": session["title"],
                 "description": session["description"],
+                "selection_mode": session["selection_mode"],
                 "mappings": session["mappings"],
                 "setup_reaction_user_id": str(session["requester_id"]),
                 "setup_reaction_keys": sorted(
@@ -3145,6 +3237,70 @@ async def handle_reaction_role_setup_event(
                     set()
                 )
                 if add_reaction:
+                    if session.get("selection_mode") == "single":
+                        for existing_emoji_key, existing_users in list(
+                            session["early_reactions"].items()
+                        ):
+                            if (
+                                existing_emoji_key != emoji_key
+                                and payload.user_id in existing_users
+                            ):
+                                old_reaction = next(
+                                    (
+                                        reaction
+                                        for reaction
+                                        in session["message"].reactions
+                                        if reaction_role_emoji_key(
+                                            reaction.emoji
+                                        ) == existing_emoji_key
+                                    ),
+                                    None
+                                )
+                                member = (
+                                    payload.member
+                                    if isinstance(
+                                        payload.member,
+                                        discord.Member
+                                    )
+                                    else None
+                                )
+                                if member is None:
+                                    try:
+                                        member = await session[
+                                            "message"
+                                        ].guild.fetch_member(payload.user_id)
+                                    except discord.NotFound:
+                                        return True
+                                    except discord.HTTPException as error:
+                                        print(
+                                            f"[REACTION ROLES] Could not find "
+                                            f"member {payload.user_id} while "
+                                            f"enforcing one-role setup in "
+                                            f"guild {session['guild_id']}: "
+                                            f"{error}"
+                                        )
+                                        return True
+                                if old_reaction is not None:
+                                    try:
+                                        await session["message"].remove_reaction(
+                                            old_reaction.emoji,
+                                            member
+                                        )
+                                    except discord.HTTPException as error:
+                                        print(
+                                            f"[REACTION ROLES] Could not "
+                                            f"remove the previous setup "
+                                            f"reaction from member "
+                                            f"{payload.user_id} on message "
+                                            f"{payload.message_id}: {error}"
+                                        )
+                                        return True
+                                existing_users.discard(payload.user_id)
+                                if not existing_users:
+                                    session["early_reactions"].pop(
+                                        existing_emoji_key,
+                                        None
+                                    )
                     reacting_users.add(payload.user_id)
                 else:
                     reacting_users.discard(payload.user_id)
@@ -3185,6 +3341,30 @@ async def handle_reaction_role_setup_event(
             return True
 
         role_id = session["role_ids"][session["next_role_index"]]
+        if (
+            session.get("selection_mode") == "single"
+            and any(
+                mapping["emoji_key"] == emoji_key
+                for mapping in session["mappings"]
+            )
+        ):
+            try:
+                await session["message"].edit(
+                    content=(
+                        reaction_role_setup_prompt(session)
+                        + "\nOne-role mode requires a different emoji for "
+                        "each role. Remove your reaction and choose another "
+                        "emoji."
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not update setup message "
+                    f"{payload.message_id}: {error}"
+                )
+            return True
+
         mapping = {
             "emoji": str(payload.emoji),
             "emoji_key": emoji_key,
@@ -3718,13 +3898,190 @@ async def handle_reaction_role_event(
     if not role_ids:
         return
 
+    selection_mode = entry.get("selection_mode", "multiple")
+    if selection_mode == "single" and len(role_ids) != 1:
+        print(
+            f"[REACTION ROLES] One-role message {payload.message_id} has "
+            f"ambiguous emoji mappings for {emoji_key}; reaction was ignored."
+        )
+        return
+
+    member = (
+        payload.member
+        if isinstance(payload.member, discord.Member)
+        else None
+    )
+    if selection_mode == "single" and not await enforce_single_role_selection(
+        guild,
+        payload,
+        mappings,
+        emoji_key,
+        add_role,
+        member
+    ):
+        return
+
     await update_reaction_role_member(
         guild,
         payload.user_id,
         role_ids,
         add_role,
-        payload.member if isinstance(payload.member, discord.Member) else None
+        member
     )
+
+
+async def enforce_single_role_selection(
+    guild: discord.Guild,
+    payload: discord.RawReactionActionEvent,
+    mappings: list[dict],
+    emoji_key: str,
+    add_role: bool,
+    member: discord.Member | None
+) -> bool:
+    selection_key = (payload.message_id, payload.user_id)
+    lock = reaction_role_user_selection_locks.setdefault(
+        selection_key,
+        asyncio.Lock()
+    )
+    async with lock:
+        previous_emoji_key = reaction_role_user_selections.get(selection_key)
+        if not add_role:
+            if previous_emoji_key == emoji_key:
+                reaction_role_user_selections.pop(selection_key, None)
+            return True
+
+        if previous_emoji_key == emoji_key:
+            return True
+
+        mapped_emoji_keys = {
+            mapping.get("emoji_key")
+            for mapping in mappings
+            if isinstance(mapping, dict)
+            and isinstance(mapping.get("emoji_key"), str)
+        }
+        previous_emoji_keys = (
+            {previous_emoji_key}
+            if previous_emoji_key is not None
+            else set()
+        )
+
+        message = None
+        channel = guild.get_channel_or_thread(payload.channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            try:
+                channel = await guild.fetch_channel(payload.channel_id)
+            except discord.NotFound:
+                print(
+                    f"[REACTION ROLES] Could not find channel "
+                    f"{payload.channel_id} while enforcing one-role mode "
+                    f"for message {payload.message_id}."
+                )
+                return False
+            except discord.HTTPException as error:
+                print(
+                    f"[REACTION ROLES] Could not fetch channel "
+                    f"{payload.channel_id} while enforcing one-role mode "
+                    f"for message {payload.message_id}: {error}"
+                )
+                return False
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            print(
+                f"[REACTION ROLES] Channel {payload.channel_id} does not "
+                f"support reaction-role messages."
+            )
+            return False
+
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            print(
+                f"[REACTION ROLES] Could not find message "
+                f"{payload.message_id} while enforcing one-role mode."
+            )
+            return False
+        except discord.HTTPException as error:
+            print(
+                f"[REACTION ROLES] Could not fetch message "
+                f"{payload.message_id} while enforcing one-role mode: "
+                f"{error}"
+            )
+            return False
+
+        if previous_emoji_key is None:
+            for reaction in message.reactions:
+                candidate_emoji_key = reaction_role_emoji_key(
+                    reaction.emoji
+                )
+                if (
+                    candidate_emoji_key == emoji_key
+                    or candidate_emoji_key not in mapped_emoji_keys
+                ):
+                    continue
+                try:
+                    async for reactor in reaction.users(limit=None):
+                        if reactor.id == payload.user_id:
+                            previous_emoji_keys.add(candidate_emoji_key)
+                            break
+                except discord.HTTPException as error:
+                    print(
+                        f"[REACTION ROLES] Could not inspect reactions on "
+                        f"message {payload.message_id} for member "
+                        f"{payload.user_id}: {error}"
+                    )
+                    return False
+
+        if previous_emoji_keys:
+            bot_member = guild.me
+            if (
+                bot_member is None
+                or not message.channel.permissions_for(
+                    bot_member
+                ).manage_messages
+            ):
+                print(
+                    f"[REACTION ROLES] Missing Manage Messages while "
+                    f"enforcing one-role mode on message "
+                    f"{payload.message_id}; new role was not assigned."
+                )
+                return False
+
+            if member is None:
+                member = guild.get_member(payload.user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(payload.user_id)
+                except discord.NotFound:
+                    return False
+                except discord.HTTPException as error:
+                    print(
+                        f"[REACTION ROLES] Could not find member "
+                        f"{payload.user_id} while enforcing one-role mode "
+                        f"for message {payload.message_id}: {error}"
+                    )
+                    return False
+
+            reactions_by_key = {
+                reaction_role_emoji_key(reaction.emoji): reaction
+                for reaction in message.reactions
+            }
+            for old_emoji_key in previous_emoji_keys:
+                old_reaction = reactions_by_key.get(old_emoji_key)
+                if old_reaction is None:
+                    continue
+                try:
+                    await message.remove_reaction(old_reaction.emoji, member)
+                except discord.NotFound:
+                    continue
+                except discord.HTTPException as error:
+                    print(
+                        f"[REACTION ROLES] Could not remove previous "
+                        f"reaction from member {payload.user_id} on message "
+                        f"{payload.message_id}: {error}"
+                    )
+                    return False
+
+        reaction_role_user_selections[selection_key] = emoji_key
+    return True
 
 
 async def update_reaction_role_member(
@@ -3791,6 +4148,8 @@ async def consume_reaction_role_setup_reaction(
         message_id_str = str(message_id)
         entry = messages.get(message_id_str)
         if not isinstance(entry, dict):
+            return False
+        if entry.get("selection_mode") == "single":
             return False
         setup_user_id = entry.get("setup_reaction_user_id")
         setup_reaction_keys = entry.get("setup_reaction_keys")
@@ -8634,8 +8993,10 @@ async def admin_help_command(
         value=(
             "Select roles in order, then use a modal to set the title and "
             "custom description. React to the posted prompt with an emoji "
-            "for each role. Administrators only; 10 messages per server, or "
-            "20 with Premium. Use /reaction-role-remove to delete one."
+            "for each role, and choose whether members can take one or "
+            "multiple roles. One-role mode requires Manage Messages. "
+            "Administrators only; 10 messages per server, or 20 with "
+            "Premium. Use /reaction-role-remove to delete one."
         ),
         inline=False
     )
@@ -8817,6 +9178,10 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
         return
 
     reaction_role_setup_sessions.pop(payload.message_id, None)
+    for selection_key in list(reaction_role_user_selections):
+        if selection_key[0] == payload.message_id:
+            reaction_role_user_selections.pop(selection_key, None)
+            reaction_role_user_selection_locks.pop(selection_key, None)
     guild = client.get_guild(payload.guild_id)
     if guild is None:
         return
@@ -9299,16 +9664,16 @@ async def on_message(message: discord.Message):
 
         embed = discord.Embed(
             title="⟡ ݁₊  Server Rules ₊ ݁⟡",
-            description="01 • Respect our Community!\n"
+            description="**01 • Respect our Community!**\n"
             "We take hate speech or troll of any kind seriously and appropriate action will be taken. This includes but is not limited to Homophobia, Transphobia, or any form of Racial or Religious Discrimination.\n\n"
-            "02 • Self Promotion\n"
+            "**02 • Self Promotion**\n"
             "We love our fellow content creators but try not to self promote in our channels without written permission from our Moderation Team of which can be contacted via our access ports.\n\n"
-            "03 • Stick to Common Sense\n"
+            "**03 • Stick to Common Sense**\n"
             "Many channels such as General and Media related channels will have specific rules which may not be listed in writing but still enforced by Mods such as No NSFW, Political or extremist conversations! These are enforced to the best of our ability and discretion.\n\n"
-            "04 • Our Moderation Team\n"
+            "**04 • Our Moderation Team**\n"
             "Our Moderation Team is here to help and assist you with any issues you may have. If you have queries about their actions or decisions please contact them via our access ports. Please do not argue with them in public channels as this will be considered a violation of Rule 01.\n\n"
-            "05 • Follow Discord ToS\n"
-            "Whilst in our server please follow Discord Terms of Service which can be found [Here]",
+            "**05 • Follow Discord ToS**\n"
+            "Whilst in our server please follow Discord Terms of Service which can be found on their website.",
             colour=discord.Colour(
                 0xffffff
             )
