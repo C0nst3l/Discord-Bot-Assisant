@@ -2872,7 +2872,7 @@ class CustomEmbedModal(discord.ui.Modal):
         title = str(self.title_input.value).strip()
         description = str(self.description_input.value).strip()
         footer = str(self.footer_input.value).strip()
-        colour_value = str(self.colour_input.value).strip()
+        colour_value = str(self.colour_input.value or "").strip()
 
         if not title or not description:
             await interaction.response.send_message(
@@ -2892,12 +2892,14 @@ class CustomEmbedModal(discord.ui.Modal):
         colour = None
         if colour_value:
             if colour_value.startswith("#"):
-                colour_value = colour_value[1:]
+                hex_value = colour_value[1:]
+            else:
+                hex_value = colour_value
             if (
-                len(colour_value) != 6
+                len(hex_value) != 6
                 or any(
                     character not in "0123456789abcdefABCDEF"
-                    for character in colour_value
+                    for character in hex_value
                 )
             ):
                 await interaction.response.send_message(
@@ -2905,7 +2907,14 @@ class CustomEmbedModal(discord.ui.Modal):
                     ephemeral=True
                 )
                 return
-            colour = discord.Colour(int(colour_value, 16))
+            try:
+                colour = discord.Colour.from_str(f"#{hex_value}")
+            except ValueError:
+                await interaction.response.send_message(
+                    "Colour must be a six-digit hex value, such as #5865F2.",
+                    ephemeral=True
+                )
+                return
 
         embed = discord.Embed(
             title=title,
@@ -2915,10 +2924,54 @@ class CustomEmbedModal(discord.ui.Modal):
         if footer:
             embed.set_footer(text=footer)
 
-        await interaction.response.send_message(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
+        channel = interaction.channel
+        if not isinstance(channel, discord.abc.Messageable):
+            await interaction.response.send_message(
+                "I couldn't find a channel where I can post this embed.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.Forbidden as error:
+            print(
+                f"[EMBED] Cannot post a custom embed in channel "
+                f"{channel.id}: {error}"
+            )
+            await interaction.followup.send(
+                "I couldn't post the embed here. Check that I have "
+                "permission to send messages and embed links in this channel.",
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            print(
+                f"[EMBED] Could not post a custom embed in channel "
+                f"{channel.id}: {error}"
+            )
+            await interaction.followup.send(
+                "I couldn't post the embed. Please try again later.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException as error:
+            print(
+                f"[EMBED] Posted the embed in channel {channel.id}, but "
+                f"could not dismiss its interaction response: {error}"
+            )
+            await interaction.followup.send(
+                "The embed was posted, but I couldn't dismiss the private "
+                "interaction response.",
+                ephemeral=True
+            )
 
 
 class ReactionRoleRemoveLastButton(discord.ui.Button):
