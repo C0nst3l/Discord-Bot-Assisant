@@ -38,6 +38,8 @@ MESSAGE_LOG_CACHE_FILE = Path("message_log_cache.sqlite3")
 MAX_FIELD_VALUE_LENGTH = 1024
 MAX_REACTION_ROLE_MESSAGES = 10
 PREMIUM_MAX_REACTION_ROLE_MESSAGES = 20
+MAX_LEVEL_ROLE_REWARDS = 10
+PREMIUM_MAX_LEVEL_ROLE_REWARDS = 20
 MAX_REACTIONS_PER_MESSAGE = 20
 MAX_GIVEAWAY_DURATION = 30 * 24 * 60 * 60
 COMPLETED_GIVEAWAY_RETENTION = 48 * 60 * 60
@@ -97,6 +99,9 @@ MODULE_COMMANDS = {
         "level-set",
         "level-xp-add",
         "level-xp-remove",
+        "level-role-add",
+        "level-role-list",
+        "level-role-remove",
         "level-channel-exclude",
         "level-channel-exclude-remove",
         "level-channel-exclude-list",
@@ -413,6 +418,84 @@ def get_guild_leveling_progress(guild_id, user_id):
         user_data = {}
 
     return guild_data, members, user_data
+
+
+def get_guild_level_rewards(guild_data):
+    rewards = guild_data.get("level_roles", [])
+    if not isinstance(rewards, list):
+        return None
+
+    validated_rewards = []
+    role_ids = set()
+    for reward in rewards:
+        if not isinstance(reward, dict):
+            return None
+
+        role_id = reward.get("role_id")
+        level = reward.get("level")
+        if (
+            not isinstance(role_id, str)
+            or not role_id.isascii()
+            or not role_id.isdigit()
+            or not isinstance(level, int)
+            or isinstance(level, bool)
+            or level < 1
+            or role_id in role_ids
+        ):
+            return None
+
+        role_ids.add(role_id)
+        validated_rewards.append({
+            "role_id": role_id,
+            "level": level,
+        })
+
+    return validated_rewards
+
+
+async def assign_guild_level_rewards(
+    member: discord.Member,
+    rewards: list[dict],
+    level: int,
+    reason: str
+) -> tuple[int, bool]:
+    roles_to_add = []
+    assignment_failed = False
+
+    for reward in rewards:
+        if reward["level"] > level:
+            continue
+
+        role = member.guild.get_role(int(reward["role_id"]))
+        if role is None:
+            print(
+                f"[LEVELING] Configured reward role {reward['role_id']} "
+                f"does not exist in guild {member.guild.id}."
+            )
+            assignment_failed = True
+        elif role in member.roles:
+            continue
+        elif not role.is_assignable():
+            print(
+                f"[LEVELING] Cannot assign reward role {role.id} in guild "
+                f"{member.guild.id}; check the bot's Manage Roles permission "
+                "and role hierarchy."
+            )
+            assignment_failed = True
+        else:
+            roles_to_add.append(role)
+
+    if roles_to_add:
+        try:
+            await member.add_roles(*roles_to_add, reason=reason)
+        except discord.HTTPException as error:
+            print(
+                f"[LEVELING] Could not assign reward roles to member "
+                f"{member.id} in guild {member.guild.id}: {error}"
+            )
+            return 0, False
+
+    return len(roles_to_add), not assignment_failed
 
 
 def get_account_created_at(user_data, now):
@@ -6915,6 +6998,13 @@ async def update_admin_guild_level(
             )
             return
 
+        level_rewards = get_guild_level_rewards(guild_data)
+        if level_rewards is None:
+            print(
+                f"[LEVELING] Invalid level reward settings for guild "
+                f"{guild_id}; level role assignment was skipped."
+            )
+
         user_data = members.get(user_id, {})
         if not isinstance(user_data, dict):
             await interaction.response.send_message(
@@ -7012,6 +7102,20 @@ async def update_admin_guild_level(
         embed=embed,
         ephemeral=True
     )
+    if updated_level > level and level_rewards:
+        _, roles_assigned = await assign_guild_level_rewards(
+            user,
+            level_rewards,
+            updated_level,
+            f"Level rewards for reaching level {updated_level}."
+        )
+        if not roles_assigned:
+            await interaction.followup.send(
+                "The level was updated, but I couldn't assign all eligible "
+                "level reward roles. Check the bot's role hierarchy and "
+                "server leveling data.",
+                ephemeral=True
+            )
 
 
 @client.tree.command(
@@ -7163,6 +7267,405 @@ async def level_xp_remove_command(
     amount: app_commands.Range[int, 1, 9007199254740991]
 ):
     await update_admin_guild_level(interaction, user, "remove", amount)
+
+
+@client.tree.command(
+    name="level-role-add",
+    description="Reward a role when members reach a level."
+)
+@app_commands.describe(
+    role="The role to grant at the selected level.",
+    level="The level members must reach to earn this role."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def level_role_add_command(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    level: app_commands.Range[int, 1, 9007199254740991]
+):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to manage level rewards.",
+            ephemeral=True
+        )
+        return
+
+    if not role.is_assignable():
+        await interaction.response.send_message(
+            "I can't assign that role. Make sure I have Manage Roles "
+            "permission and the role is below my highest role.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild_id = str(guild.id)
+    error_message = None
+    rewards = None
+    saved_members = {}
+    limit = MAX_LEVEL_ROLE_REWARDS
+    async with guild_leveling_lock:
+        guild_data = guild_leveling_userdata.get(guild_id, {})
+        if not isinstance(guild_data, dict):
+            error_message = (
+                "Saved server leveling data is invalid. Please contact a "
+                "server administrator."
+            )
+        else:
+            rewards = get_guild_level_rewards(guild_data)
+            members = guild_data.get("members", {})
+            settings = get_server_settings(guild.id)
+            if not isinstance(settings, dict):
+                error_message = (
+                    "Saved server settings are invalid. Please contact a "
+                    "server administrator."
+                )
+            else:
+                limit = (
+                    PREMIUM_MAX_LEVEL_ROLE_REWARDS
+                    if settings.get("assistantmini_premium") is True
+                    else MAX_LEVEL_ROLE_REWARDS
+                )
+
+            if error_message is None and (
+                rewards is None or not isinstance(members, dict)
+            ):
+                error_message = (
+                    "Saved server leveling settings are invalid. Please "
+                    "contact a server administrator."
+                )
+            elif error_message is None and rewards is not None and any(
+                reward["role_id"] == str(role.id)
+                for reward in rewards
+            ):
+                error_message = (
+                    f"{role.mention} already has a level reward. Remove it "
+                    "before adding a different level."
+                )
+            elif (
+                error_message is None
+                and rewards is not None
+                and len(rewards) >= limit
+            ):
+                error_message = (
+                    f"This server has reached its limit of {limit} level "
+                    "rewards. Remove one before adding another."
+                )
+            elif error_message is None and rewards is not None:
+                updated_rewards = [
+                    *rewards,
+                    {
+                        "role_id": str(role.id),
+                        "level": level,
+                    },
+                ]
+                updated_guild_data = {
+                    **guild_data,
+                    "level_roles": updated_rewards,
+                }
+                updated_guild_leveling_userdata = {
+                    **guild_leveling_userdata,
+                    guild_id: updated_guild_data,
+                }
+                if not save_json(
+                    GUILD_LEVELING_USERDATA_FILE,
+                    updated_guild_leveling_userdata
+                ):
+                    error_message = (
+                        "The level reward could not be saved. Please try "
+                        "again later."
+                    )
+                else:
+                    guild_leveling_userdata[guild_id] = updated_guild_data
+                    saved_members = dict(members)
+                    rewards = updated_rewards
+
+    if error_message is not None:
+        await interaction.followup.send(error_message, ephemeral=True)
+        return
+    if rewards is None:
+        await interaction.followup.send(
+            "Saved level reward settings are invalid. Please contact a "
+            "server administrator.",
+            ephemeral=True
+        )
+        return
+
+    current_members = list(guild.members)
+    member_scan_complete = True
+    if not guild.chunked:
+        try:
+            current_members = [
+                member
+                async for member in guild.fetch_members(limit=None)
+            ]
+        except discord.HTTPException as error:
+            print(
+                f"[LEVELING] Could not fetch all members in guild "
+                f"{guild.id} while applying a new reward: {error}"
+            )
+            member_scan_complete = False
+
+    assigned_count = 0
+    assignment_failed_count = 0
+    for member in current_members:
+        user_data = saved_members.get(str(member.id), {})
+        if not isinstance(user_data, dict):
+            print(
+                f"[LEVELING] Invalid saved level data for member "
+                f"{member.id} in guild {guild.id}; reward was not assigned."
+            )
+            continue
+
+        member_level = user_data.get("level", 0)
+        if (
+            not isinstance(member_level, int)
+            or isinstance(member_level, bool)
+            or member_level < 0
+        ):
+            print(
+                f"[LEVELING] Invalid saved level for member {member.id} "
+                f"in guild {guild.id}; reward was not assigned."
+            )
+            continue
+        if member_level < level:
+            continue
+
+        assigned, success = await assign_guild_level_rewards(
+            member,
+            rewards,
+            member_level,
+            f"Level {level} reward configured."
+        )
+        assigned_count += assigned
+        if not success:
+            assignment_failed_count += 1
+
+    response = (
+        f"Added {role.mention} as a level {level} reward and assigned "
+        f"{assigned_count} eligible reward role(s) to current members."
+    )
+    if not member_scan_complete:
+        response += (
+            "\nI couldn't check every current member. The rule is saved, "
+            "but some qualifying members may need the role assigned manually."
+        )
+    if assignment_failed_count:
+        response += (
+            f"\nI couldn't assign all configured rewards for "
+            f"{assignment_failed_count} member(s). Check the bot's role "
+            "hierarchy and server leveling data."
+        )
+    await interaction.followup.send(
+        response,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@client.tree.command(
+    name="level-role-list",
+    description="List this server's level role rewards."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def level_role_list_command(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to manage level rewards.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = str(guild.id)
+    async with guild_leveling_lock:
+        guild_data = guild_leveling_userdata.get(guild_id, {})
+        if not isinstance(guild_data, dict):
+            await interaction.response.send_message(
+                "Saved server leveling data is invalid. Please contact a "
+                "server administrator.",
+                ephemeral=True
+            )
+            return
+
+        rewards = get_guild_level_rewards(guild_data)
+        if rewards is None:
+            print(
+                f"[LEVELING] Invalid level reward settings for guild "
+                f"{guild.id}."
+            )
+            await interaction.response.send_message(
+                "Saved level reward settings are invalid. Please contact a "
+                "server administrator.",
+                ephemeral=True
+            )
+            return
+
+    settings = get_server_settings(guild.id)
+    if not isinstance(settings, dict):
+        await interaction.response.send_message(
+            "Saved server settings are invalid. Please contact a server "
+            "administrator.",
+            ephemeral=True
+        )
+        return
+
+    limit = (
+        PREMIUM_MAX_LEVEL_ROLE_REWARDS
+        if settings.get("assistantmini_premium") is True
+        else MAX_LEVEL_ROLE_REWARDS
+    )
+    if not rewards:
+        response = "No level role rewards are configured for this server."
+    else:
+        reward_lines = []
+        for reward in sorted(
+            rewards,
+            key=lambda item: (item["level"], int(item["role_id"]))
+        ):
+            role = guild.get_role(int(reward["role_id"]))
+            role_text = (
+                role.mention
+                if role is not None
+                else f"Deleted role (`{reward['role_id']}`)"
+            )
+            reward_lines.append(
+                f"Level {reward['level']}: {role_text}"
+            )
+        response = (
+            f"**Level role rewards ({len(rewards)}/{limit}):**\n"
+            + "\n".join(reward_lines)
+            + "\nMembers keep roles they've already earned if a reward is "
+            "removed."
+        )
+
+    await interaction.response.send_message(
+        response,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@client.tree.command(
+    name="level-role-remove",
+    description="Remove a role from this server's level rewards."
+)
+@app_commands.describe(role="The reward role to remove.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def level_role_remove_command(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to manage level rewards.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = str(guild.id)
+    async with guild_leveling_lock:
+        guild_data = guild_leveling_userdata.get(guild_id, {})
+        if not isinstance(guild_data, dict):
+            await interaction.response.send_message(
+                "Saved server leveling data is invalid. Please contact a "
+                "server administrator.",
+                ephemeral=True
+            )
+            return
+
+        rewards = get_guild_level_rewards(guild_data)
+        if rewards is None:
+            print(
+                f"[LEVELING] Invalid level reward settings for guild "
+                f"{guild.id}."
+            )
+            await interaction.response.send_message(
+                "Saved level reward settings are invalid. Please contact a "
+                "server administrator.",
+                ephemeral=True
+            )
+            return
+
+        role_id = str(role.id)
+        if not any(
+            reward["role_id"] == role_id
+            for reward in rewards
+        ):
+            await interaction.response.send_message(
+                f"{role.mention} is not configured as a level reward.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+
+        updated_rewards = [
+            reward
+            for reward in rewards
+            if reward["role_id"] != role_id
+        ]
+        updated_guild_data = {
+            **guild_data,
+            "level_roles": updated_rewards,
+        }
+        updated_guild_leveling_userdata = {
+            **guild_leveling_userdata,
+            guild_id: updated_guild_data,
+        }
+        if not save_json(
+            GUILD_LEVELING_USERDATA_FILE,
+            updated_guild_leveling_userdata
+        ):
+            await interaction.response.send_message(
+                "The level reward could not be removed. Please try again later.",
+                ephemeral=True
+            )
+            return
+
+        guild_leveling_userdata[guild_id] = updated_guild_data
+
+    await interaction.response.send_message(
+        f"Removed {role.mention} from level rewards. Members keep roles "
+        "they've already earned.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 # ============================================================
@@ -9139,7 +9642,9 @@ async def admin_help_command(
         name="/level-channel-exclude",
         value="Add channels excluded from level experience. Administrators only.\n"
         "`/level-channel-exclude-remove`, `/level-channel-exclude-list`, "
-        "`/level-set`, `/level-xp-add`, `/level-xp-remove`.",
+        "`/level-set`, `/level-xp-add`, `/level-xp-remove`.\n"
+        "Level rewards: `/level-role-add`, `/level-role-list`, "
+        "`/level-role-remove` (10 rewards per server, 20 with Premium).",
         inline=False
     )
 
@@ -9677,6 +10182,8 @@ async def on_message(message: discord.Message):
         guild_id = str(message.guild.id)
         user_id = str(message.author.id)
         now = time.time()
+        pending_level_rewards = None
+        pending_reward_level = None
 
         async with guild_leveling_lock:
             guild_data, members, user_data = get_guild_leveling_progress(
@@ -9765,6 +10272,36 @@ async def on_message(message: discord.Message):
                             guild_leveling_userdata[guild_id] = (
                                 updated_guild_data
                             )
+                            if (
+                                should_save
+                                and updated_user_data["level"] >= 1
+                            ):
+                                level_rewards = get_guild_level_rewards(
+                                    updated_guild_data
+                                )
+                                if level_rewards is None:
+                                    print(
+                                        f"[LEVELING] Invalid level reward "
+                                        f"settings for guild {guild_id}; "
+                                        "role assignment was skipped."
+                                    )
+                                else:
+                                    pending_level_rewards = level_rewards
+                                    pending_reward_level = (
+                                        updated_user_data["level"]
+                                    )
+
+        if (
+            pending_level_rewards
+            and pending_reward_level is not None
+            and isinstance(message.author, discord.Member)
+        ):
+            await assign_guild_level_rewards(
+                message.author,
+                pending_level_rewards,
+                pending_reward_level,
+                f"Level rewards for reaching level {pending_reward_level}."
+            )
 
     if message.content.lower().startswith("!prerules"):
         if message.guild is None or not isinstance(message.author, discord.Member):
