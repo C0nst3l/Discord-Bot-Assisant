@@ -125,6 +125,11 @@ MODULE_COMMANDS = {
         "counting-channel",
         "counting-channel-remove",
     },
+    "logging": {
+        "log-role-ignore",
+        "log-role-list",
+        "log-role-remove",
+    },
     "automod": {
         "automod-phrases-add",
         "automod-phrases-remove",
@@ -293,6 +298,7 @@ def get_default_server_settings():
         "automod_phrases": [],
         "automod_log_channel_id": None,
         "automod_owner_alerted": False,
+        "log_ignored_roles": [],
         "reaction_role_messages": {},
         "modules": {
             module_name: module_name != "logging"
@@ -8393,6 +8399,67 @@ def is_logging_excluded(settings, channel_id: int) -> bool | None:
     return str(channel_id) in excluded_channels
 
 
+def get_logging_ignored_role_ids(settings) -> list[str] | None:
+    role_ids = settings.get("log_ignored_roles", [])
+    if (
+        not isinstance(role_ids, list)
+        or any(
+            not isinstance(role_id, str)
+            or not role_id.isascii()
+            or not role_id.isdigit()
+            for role_id in role_ids
+        )
+        or len(role_ids) != len(set(role_ids))
+    ):
+        return None
+    return role_ids
+
+
+async def is_logging_role_ignored(
+    guild: discord.Guild,
+    settings,
+    author_id,
+    member: discord.Member | None = None
+) -> bool | None:
+    ignored_role_ids = get_logging_ignored_role_ids(settings)
+    if ignored_role_ids is None:
+        print(
+            f"[LOGGING] Invalid ignored-role list for guild {guild.id}; "
+            "message logging was skipped."
+        )
+        return None
+    if not ignored_role_ids:
+        return False
+
+    if (
+        not isinstance(author_id, str)
+        or not author_id.isascii()
+        or not author_id.isdigit()
+    ):
+        return None
+
+    author_user_id = int(author_id)
+    if member is None or member.id != author_user_id:
+        member = guild.get_member(author_user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(author_user_id)
+        except discord.NotFound:
+            return False
+        except discord.HTTPException as error:
+            print(
+                f"[LOGGING] Could not fetch message author "
+                f"{author_user_id} in guild {guild.id} to check ignored "
+                f"roles: {error}"
+            )
+            return None
+
+    return any(
+        str(role.id) in ignored_role_ids
+        for role in member.roles
+    )
+
+
 message_log_cache_connection = None
 
 
@@ -9483,6 +9550,237 @@ async def log_channel_exclude_list_command(
     )
 
 
+@client.tree.command(
+    name="log-role-ignore",
+    description="Ignore a role's messages in edited and deleted message logs."
+)
+@app_commands.describe(
+    role="The role whose edited and deleted messages will not be logged."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_role_ignore_command(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None or role.guild.id != guild.id:
+        await interaction.response.send_message(
+            "Choose a role from this server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    if not isinstance(settings, dict):
+        await interaction.response.send_message(
+            "Saved server settings are invalid. Please contact a server "
+            "administrator.",
+            ephemeral=True
+        )
+        return
+
+    ignored_role_ids = get_logging_ignored_role_ids(settings)
+    if ignored_role_ids is None:
+        print(
+            f"[LOGGING] Invalid ignored-role list for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Saved ignored-role settings are invalid. Please contact a "
+            "server administrator.",
+            ephemeral=True
+        )
+        return
+
+    role_id = str(role.id)
+    if role_id in ignored_role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is already excluded from message logging.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    updated_role_ids = [*ignored_role_ids, role_id]
+    if not save_logging_setting(
+        guild.id,
+        "log_ignored_roles",
+        updated_role_ids
+    ):
+        await interaction.response.send_message(
+            "The ignored role could not be saved. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Edited and deleted messages from {role.mention} members will no "
+        "longer be logged in any channel.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@client.tree.command(
+    name="log-role-list",
+    description="List roles excluded from edited and deleted message logs."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_role_list_command(interaction: discord.Interaction):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    if not isinstance(settings, dict):
+        await interaction.response.send_message(
+            "Saved server settings are invalid. Please contact a server "
+            "administrator.",
+            ephemeral=True
+        )
+        return
+
+    ignored_role_ids = get_logging_ignored_role_ids(settings)
+    if ignored_role_ids is None:
+        print(
+            f"[LOGGING] Invalid ignored-role list for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Saved ignored-role settings are invalid. Please contact a "
+            "server administrator.",
+            ephemeral=True
+        )
+        return
+
+    if not ignored_role_ids:
+        await interaction.response.send_message(
+            "No roles are excluded from message logging.",
+            ephemeral=True
+        )
+        return
+
+    role_lines = []
+    for role_id in ignored_role_ids:
+        role = guild.get_role(int(role_id))
+        role_lines.append(
+            f"- {role.mention}"
+            if role is not None
+            else f"- Deleted role (`{role_id}`)"
+        )
+
+    chunks = []
+    current_chunk = "Roles excluded from edited and deleted message logs:\n"
+    for line in role_lines:
+        line_with_newline = f"{line}\n"
+        if len(current_chunk) + len(line_with_newline) > 1900:
+            chunks.append(current_chunk.rstrip())
+            current_chunk = ""
+        current_chunk += line_with_newline
+    if current_chunk:
+        chunks.append(current_chunk.rstrip())
+
+    await interaction.response.send_message(
+        chunks[0],
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+    for chunk in chunks[1:]:
+        await interaction.followup.send(
+            chunk,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+
+@client.tree.command(
+    name="log-role-remove",
+    description="Allow a role's messages to be logged again."
+)
+@app_commands.describe(
+    role="The role to remove from the message logging exclusions."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def log_role_remove_command(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    if not await require_module_admin(interaction):
+        return
+
+    guild = interaction.guild
+    if guild is None or role.guild.id != guild.id:
+        await interaction.response.send_message(
+            "Choose a role from this server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    if not isinstance(settings, dict):
+        await interaction.response.send_message(
+            "Saved server settings are invalid. Please contact a server "
+            "administrator.",
+            ephemeral=True
+        )
+        return
+
+    ignored_role_ids = get_logging_ignored_role_ids(settings)
+    if ignored_role_ids is None:
+        print(
+            f"[LOGGING] Invalid ignored-role list for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Saved ignored-role settings are invalid. Please contact a "
+            "server administrator.",
+            ephemeral=True
+        )
+        return
+
+    role_id = str(role.id)
+    if role_id not in ignored_role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is not excluded from message logging.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    updated_role_ids = [
+        item
+        for item in ignored_role_ids
+        if item != role_id
+    ]
+    if not save_logging_setting(
+        guild.id,
+        "log_ignored_roles",
+        updated_role_ids
+    ):
+        await interaction.response.send_message(
+            "The ignored role could not be removed. Please try again later.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Edited and deleted messages from {role.mention} members can now "
+        "be logged.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
 # ============================================================
 # Help Command
 # ============================================================
@@ -9624,7 +9922,9 @@ async def admin_help_command(
     embed.add_field(
         name="/log-channel",
         value="Choose the channel for edited and deleted message logs. Administrators only.\n"
-        "`/log-exclude-channel`, `/log-channel-exclude-list`.",
+        "`/log-exclude-channel`, `/log-channel-exclude-list`, "
+        "`/log-role-ignore`, `/log-role-list`, `/log-role-remove`. "
+        "Ignored roles are excluded in every channel.",
         inline=False
     )
 
@@ -9784,6 +10084,20 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if contains_gif:
         return
 
+    role_ignored = await is_logging_role_ignored(
+        guild,
+        settings,
+        updated.get("author_id")
+    )
+    if role_ignored is None:
+        print(
+            f"[LOGGING] Could not verify ignored roles for edited message "
+            f"{payload.message_id}; message was not logged."
+        )
+        return
+    if role_ignored:
+        return
+
     embed = create_message_log_embed(
         "Edited",
         guild.id,
@@ -9849,6 +10163,38 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
 
     if snapshot is None and message is not None:
         snapshot = create_message_snapshot(message)
+
+    author_id = (
+        snapshot.get("author_id")
+        if isinstance(snapshot, dict)
+        else None
+    )
+    member = (
+        message.author
+        if message is not None
+        and isinstance(message.author, discord.Member)
+        else None
+    )
+    role_ignored = await is_logging_role_ignored(
+        guild,
+        settings,
+        author_id,
+        member
+    )
+    if role_ignored is not False:
+        if role_ignored is None:
+            print(
+                f"[LOGGING] Could not verify ignored roles for deleted "
+                f"message {payload.message_id}; message was not logged."
+            )
+        try:
+            delete_message_snapshot(guild.id, payload.message_id)
+        except sqlite3.Error as error:
+            print(
+                f"[LOGGING] Could not remove snapshot for deleted message "
+                f"{payload.message_id}: {error}"
+            )
+        return
 
     if snapshot is not None:
         embed = create_message_log_embed(
