@@ -2736,6 +2736,102 @@ class ReactionRoleDetailsModal(discord.ui.Modal):
         )
 
 
+class CustomEmbedModal(discord.ui.Modal):
+
+    def __init__(self):
+        super().__init__(title="Create Embed")
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="Enter the embed title",
+            max_length=256
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description",
+            placeholder="Enter the embed description",
+            style=discord.TextStyle.paragraph,
+            max_length=4000
+        )
+        self.colour_input = discord.ui.TextInput(
+            label="Colour (hex)",
+            placeholder="Optional, e.g. #5865F2",
+            required=False,
+            max_length=7
+        )
+        self.footer_input = discord.ui.TextInput(
+            label="Footer",
+            placeholder="Optional footer text",
+            required=False,
+            max_length=2048
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.colour_input)
+        self.add_item(self.footer_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if (
+            interaction.guild is None
+            or not isinstance(interaction.user, discord.Member)
+            or not interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need the Administrator permission to create embeds.",
+                ephemeral=True
+            )
+            return
+
+        title = str(self.title_input.value).strip()
+        description = str(self.description_input.value).strip()
+        footer = str(self.footer_input.value).strip()
+        colour_value = str(self.colour_input.value).strip()
+
+        if not title or not description:
+            await interaction.response.send_message(
+                "The title and description cannot be empty.",
+                ephemeral=True
+            )
+            return
+
+        if len(title) + len(description) + len(footer) > 6000:
+            await interaction.response.send_message(
+                "The title, description, and footer must total no more than "
+                "6,000 characters.",
+                ephemeral=True
+            )
+            return
+
+        colour = None
+        if colour_value:
+            if colour_value.startswith("#"):
+                colour_value = colour_value[1:]
+            if (
+                len(colour_value) != 6
+                or any(
+                    character not in "0123456789abcdefABCDEF"
+                    for character in colour_value
+                )
+            ):
+                await interaction.response.send_message(
+                    "Colour must be a six-digit hex value, such as #5865F2.",
+                    ephemeral=True
+                )
+                return
+            colour = discord.Colour(int(colour_value, 16))
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=colour
+        )
+        if footer:
+            embed.set_footer(text=footer)
+
+        await interaction.response.send_message(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+
 class ReactionRoleRemoveLastButton(discord.ui.Button):
 
     def __init__(self, setup_view):
@@ -3516,6 +3612,27 @@ async def reaction_role_new_command(interaction: discord.Interaction):
         allowed_mentions=discord.AllowedMentions.none()
     )
     view.setup_message = await interaction.original_response()
+
+
+@client.tree.command(
+    name="embed",
+    description="Create a custom embed in this channel."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def embed_command(interaction: discord.Interaction):
+    if (
+        interaction.guild is None
+        or not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to create embeds.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(CustomEmbedModal())
 
 
 @client.tree.command(
