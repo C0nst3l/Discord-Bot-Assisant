@@ -2595,8 +2595,10 @@ async def verification_setup_command(
 
     embed = discord.Embed(
         title="Server Verification",
-        description="By Verifying you automatically agree to all Server Rules",
-        colour=discord.Colour.blue()
+        description="Interact with the button below to verify in our Server which gains access to all channels and voice channels.\n"
+        "This is to ensure that you are a human and not a bot and will not store any personal information.\n\n"
+        "Keep in mind that by verifing you automatically agree to the rules of this server.",
+        colour=discord.Colour.green()
     )
 
     try:
