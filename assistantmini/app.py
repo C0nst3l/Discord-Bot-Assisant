@@ -85,6 +85,7 @@ MODULE_LABELS = {
     "automod": "AutoMod",
     "reaction_roles": "Reaction Roles",
     "autorole": "AutoRole",
+    "verification": "Verification",
 }
 MODULE_COMMANDS = {
     "giveaways": {
@@ -145,11 +146,17 @@ MODULE_COMMANDS = {
         "autorole-list",
         "autorole-remove",
     },
+    "verification": {
+        "verification-setup",
+    },
 }
 COMMAND_MODULES = {
     command_name: module_name
     for module_name, command_names in MODULE_COMMANDS.items()
     for command_name in command_names
+}
+VERIFICATION_TYPES = {
+    "button": "Verify button",
 }
 
 # How often failed giveaway completions are retried.
@@ -300,6 +307,7 @@ def get_default_server_settings():
         "automod_owner_alerted": False,
         "log_ignored_roles": [],
         "reaction_role_messages": {},
+        "verification": None,
         "modules": {
             module_name: module_name != "logging"
             for module_name in MODULE_LABELS
@@ -1278,6 +1286,8 @@ class AssistantMini(discord.Client):
                     f"{giveaway_id}: {error}"
                 )
 
+        self.add_view(VerificationView())
+
         await self.tree.sync()
 
         print(
@@ -1464,6 +1474,29 @@ class GiveawayView(discord.ui.View):
         self.add_item(
             GiveawayEnterButton(giveaway_id)
         )
+
+
+class VerificationButton(discord.ui.Button):
+
+    def __init__(self):
+        super().__init__(
+            label="Verify",
+            style=discord.ButtonStyle.success,
+            custom_id="verification:verify"
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ) -> None:
+        await complete_verification(interaction)
+
+
+class VerificationView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(VerificationButton())
 
 
 # ============================================================
@@ -2328,6 +2361,287 @@ async def on_entitlement_create(entitlement: discord.Entitlement):
             entitlement.user_id,
             entitlement.id
         )
+
+
+# ============================================================
+# VERIFICATION
+# ============================================================
+
+def get_verification_config(settings):
+    config = settings.get("verification")
+    if config is None:
+        return None
+
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("channel_id"), str)
+        or not config["channel_id"].isdigit()
+        or not isinstance(config.get("role_id"), str)
+        or not config["role_id"].isdigit()
+        or config.get("type") not in VERIFICATION_TYPES
+    ):
+        return None
+
+    return config
+
+
+def save_verification_config(guild_id: int, config: dict) -> bool:
+    guild_id_str = str(guild_id)
+    updated_settings = {
+        **get_server_settings(guild_id),
+        "verification": config,
+    }
+    updated_server_settings = {
+        **server_settings,
+        guild_id_str: updated_settings,
+    }
+
+    if not save_json(SETTINGS_FILE, updated_server_settings):
+        return False
+
+    server_settings[guild_id_str] = updated_settings
+    return True
+
+
+async def complete_verification(
+    interaction: discord.Interaction
+) -> None:
+    guild = interaction.guild
+    member = interaction.user
+    if guild is None or not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "Verification can only be completed in a server.",
+            ephemeral=True
+        )
+        return
+
+    settings = get_server_settings(guild.id)
+    enabled = get_module_enabled(settings, "verification")
+    if enabled is None:
+        print(
+            f"[VERIFICATION] Invalid module settings for guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "Verification settings are invalid. Please contact a server administrator.",
+            ephemeral=True
+        )
+        return
+    if not enabled:
+        await interaction.response.send_message(
+            "Verification is currently disabled in this server.",
+            ephemeral=True
+        )
+        return
+
+    if settings.get("verification") is None:
+        await interaction.response.send_message(
+            "Verification is not configured in this server.",
+            ephemeral=True
+        )
+        return
+
+    config = get_verification_config(settings)
+    if config is None:
+        print(
+            f"[VERIFICATION] Invalid verification settings for guild "
+            f"{guild.id}."
+        )
+        await interaction.response.send_message(
+            "Verification is not configured correctly. Please contact a server administrator.",
+            ephemeral=True
+        )
+        return
+
+    if interaction.channel_id != int(config["channel_id"]):
+        await interaction.response.send_message(
+            "This verification message is no longer active. Please use the "
+            "current message in the configured verification channel.",
+            ephemeral=True
+        )
+        return
+
+    role = guild.get_role(int(config["role_id"]))
+    if role is None:
+        print(
+            f"[VERIFICATION] Configured role {config['role_id']} no longer "
+            f"exists in guild {guild.id}."
+        )
+        await interaction.response.send_message(
+            "The verified role is unavailable. Please contact a server administrator.",
+            ephemeral=True
+        )
+        return
+
+    if role in member.roles:
+        await interaction.response.send_message(
+            "You are already verified.",
+            ephemeral=True
+        )
+        return
+
+    if not role.is_assignable():
+        print(
+            f"[VERIFICATION] Cannot assign role {role.id} in guild "
+            f"{guild.id}; check the bot's Manage Roles permission and role "
+            "hierarchy."
+        )
+        await interaction.response.send_message(
+            "I can't assign the verified role. Please contact a server administrator.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await member.add_roles(
+            role,
+            reason="Member completed server verification"
+        )
+    except discord.HTTPException as error:
+        print(
+            f"[VERIFICATION] Could not assign role {role.id} to member "
+            f"{member.id} in guild {guild.id}: {error}"
+        )
+        await interaction.response.send_message(
+            "I couldn't assign your verified role. Please contact a server administrator.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"You are verified and now have the {role.mention} role.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@client.tree.command(
+    name="verification-setup",
+    description="Set up the server's verification message."
+)
+@app_commands.describe(
+    channel="The channel where new members will verify.",
+    verification_type="The verification method to use.",
+    verified_role="The role members receive when they verify."
+)
+@app_commands.choices(
+    verification_type=[
+        app_commands.Choice(name=label, value=type_name)
+        for type_name, label in VERIFICATION_TYPES.items()
+    ]
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def verification_setup_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    verification_type: app_commands.Choice[str],
+    verified_role: discord.Role
+):
+    guild = interaction.guild
+    if (
+        guild is None
+        or not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message(
+            "You need the Administrator permission to configure verification.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.response.send_message(
+            "I couldn't verify my permissions in that server. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    permissions = channel.permissions_for(bot_member)
+    if not (
+        permissions.view_channel
+        and permissions.send_messages
+        and permissions.embed_links
+    ):
+        await interaction.response.send_message(
+            "I need permission to view, send messages, and embed links in "
+            f"{channel.mention} before it can be used for verification.",
+            ephemeral=True
+        )
+        return
+
+    if verified_role.id == guild.id or not verified_role.is_assignable():
+        await interaction.response.send_message(
+            "I can't assign that role. Make sure it isn't managed or the "
+            "@everyone role, is below my highest role, and that I have Manage Roles permission.",
+            ephemeral=True
+        )
+        return
+
+    config = {
+        "channel_id": str(channel.id),
+        "role_id": str(verified_role.id),
+        "type": verification_type.value,
+    }
+    previous_settings = get_server_settings(guild.id)
+    had_previous_config = "verification" in previous_settings
+    previous_config = previous_settings.get("verification")
+    if not save_verification_config(guild.id, config):
+        await interaction.response.send_message(
+            "I couldn't save the verification settings. Please try again.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Server Verification",
+        description="By Verifying you automatically agree to all Server Rules",
+        colour=discord.Colour.blue()
+    )
+
+    try:
+        await channel.send(
+            embed=embed,
+            view=VerificationView(),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.HTTPException as error:
+        print(
+            f"[VERIFICATION] Could not send the setup message in channel "
+            f"{channel.id} for guild {guild.id}: {error}"
+        )
+        rollback_settings = {
+            **get_server_settings(guild.id),
+        }
+        if had_previous_config:
+            rollback_settings["verification"] = previous_config
+        else:
+            rollback_settings.pop("verification", None)
+        rollback_server_settings = {
+            **server_settings,
+            str(guild.id): rollback_settings,
+        }
+        if save_json(SETTINGS_FILE, rollback_server_settings):
+            server_settings[str(guild.id)] = rollback_settings
+        else:
+            print(
+                f"[VERIFICATION] Could not roll back failed setup for guild "
+                f"{guild.id}."
+            )
+        await interaction.response.send_message(
+            "I couldn't send the verification message. Check my channel "
+            "permissions and try again.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Verification is set up in {channel.mention} using the "
+        f"{verification_type.name}. Members who verify will receive "
+        f"{verified_role.mention}.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 # ============================================================
