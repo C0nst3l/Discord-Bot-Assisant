@@ -1,10 +1,12 @@
 import asyncio
 from datetime import date, datetime, timedelta
+from io import BytesIO
 import json
 import math
 import os
 import random
 import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -13,6 +15,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 
 # ============================================================
@@ -62,6 +65,10 @@ LEVEL_REWARD_EXPERIENCE = 5
 GUILD_LEVEL_XP_MIN = 15
 GUILD_LEVEL_XP_MAX = 30
 GUILD_LEVEL_XP_COOLDOWN = 60
+CAPTCHA_LENGTH = 6
+CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_EXPIRY_SECONDS = 5 * 60
+CAPTCHA_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 PRIVATE_ECONOMY_EMBED_COMMANDS = {
     "economy-coin-flip",
     "economy-daily",
@@ -157,7 +164,9 @@ COMMAND_MODULES = {
 }
 VERIFICATION_TYPES = {
     "button": "Verify button",
+    "captcha": "Visual CAPTCHA",
 }
+captcha_challenges = {}
 
 # How often failed giveaway completions are retried.
 RETRY_DELAY = 30
@@ -1499,6 +1508,161 @@ class VerificationView(discord.ui.View):
         self.add_item(VerificationButton())
 
 
+class CaptchaPromptButton(discord.ui.Button):
+
+    def __init__(
+        self,
+        guild_id: int,
+        member_id: int,
+        challenge_id: str
+    ):
+        super().__init__(
+            label="Enter CAPTCHA",
+            style=discord.ButtonStyle.primary
+        )
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.challenge_id = challenge_id
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ) -> None:
+        if (
+            interaction.guild_id != self.guild_id
+            or interaction.user.id != self.member_id
+        ):
+            await interaction.response.send_message(
+                "This CAPTCHA belongs to another member.",
+                ephemeral=True
+            )
+            return
+
+        key = (self.guild_id, self.member_id)
+        challenge = captcha_challenges.get(key)
+        if (
+            challenge is None
+            or challenge.get("id") != self.challenge_id
+            or challenge.get("expires_at", 0) <= time.time()
+        ):
+            if challenge is not None and challenge.get("id") == self.challenge_id:
+                captcha_challenges.pop(key, None)
+            await interaction.response.send_message(
+                "This CAPTCHA has expired. Click Verify to start a new one.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            CaptchaAnswerModal(
+                self.guild_id,
+                self.member_id,
+                self.challenge_id
+            )
+        )
+
+
+class CaptchaPromptView(discord.ui.View):
+
+    def __init__(
+        self,
+        guild_id: int,
+        member_id: int,
+        challenge_id: str
+    ):
+        super().__init__(timeout=CAPTCHA_EXPIRY_SECONDS)
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.challenge_id = challenge_id
+        self.add_item(
+            CaptchaPromptButton(guild_id, member_id, challenge_id)
+        )
+
+    async def on_timeout(self) -> None:
+        key = (self.guild_id, self.member_id)
+        challenge = captcha_challenges.get(key)
+        if challenge is not None and challenge.get("id") == self.challenge_id:
+            captcha_challenges.pop(key, None)
+
+
+class CaptchaAnswerModal(discord.ui.Modal):
+
+    def __init__(
+        self,
+        guild_id: int,
+        member_id: int,
+        challenge_id: str
+    ):
+        super().__init__(
+            title="CAPTCHA verification",
+            timeout=CAPTCHA_EXPIRY_SECONDS
+        )
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.challenge_id = challenge_id
+        self.answer_input = discord.ui.TextInput(
+            label=f"Enter the {CAPTCHA_LENGTH}-character code",
+            min_length=CAPTCHA_LENGTH,
+            max_length=CAPTCHA_LENGTH,
+            required=True
+        )
+        self.add_item(self.answer_input)
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ) -> None:
+        if (
+            interaction.guild_id != self.guild_id
+            or interaction.user.id != self.member_id
+        ):
+            await interaction.response.send_message(
+                "This CAPTCHA belongs to another member.",
+                ephemeral=True
+            )
+            return
+
+        key = (self.guild_id, self.member_id)
+        challenge = captcha_challenges.get(key)
+        if (
+            challenge is None
+            or challenge.get("id") != self.challenge_id
+            or challenge.get("expires_at", 0) <= time.time()
+        ):
+            if challenge is not None and challenge.get("id") == self.challenge_id:
+                captcha_challenges.pop(key, None)
+            await interaction.response.send_message(
+                "This CAPTCHA has expired. Click Verify to start a new one.",
+                ephemeral=True
+            )
+            return
+
+        answer = self.answer_input.value.strip().upper()
+        if not secrets.compare_digest(answer, challenge["answer"]):
+            challenge["attempts"] += 1
+            attempts_remaining = CAPTCHA_MAX_ATTEMPTS - challenge["attempts"]
+            if attempts_remaining == 0:
+                captcha_challenges.pop(key, None)
+                await interaction.response.send_message(
+                    "You used all attempts. Click Verify to start a new CAPTCHA.",
+                    ephemeral=True
+                )
+                return
+
+            await interaction.response.send_message(
+                f"That code wasn't correct. You have {attempts_remaining} "
+                "attempts remaining.",
+                ephemeral=True
+            )
+            return
+
+        captcha_challenges.pop(key, None)
+        await complete_verification(
+            interaction,
+            captcha_passed=True
+        )
+
+
 # ============================================================
 # GIVEAWAY RECOVERY
 # ============================================================
@@ -2403,8 +2567,125 @@ def save_verification_config(guild_id: int, config: dict) -> bool:
     return True
 
 
+def create_captcha_image(answer: str) -> BytesIO:
+    width = 360
+    height = 140
+    image = Image.new("RGB", (width, height), (248, 249, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=46)
+
+    for _ in range(100):
+        x = random.randrange(width)
+        y = random.randrange(height)
+        draw.point(
+            (x, y),
+            fill=(random.randrange(175, 225), random.randrange(175, 225), 235)
+        )
+
+    for _ in range(6):
+        draw.line(
+            (
+                random.randrange(width),
+                random.randrange(height),
+                random.randrange(width),
+                random.randrange(height)
+            ),
+            fill=(random.randrange(155, 195), random.randrange(155, 195), 220),
+            width=2
+        )
+
+    text_bounds = draw.textbbox((0, 0), answer, font=font, stroke_width=1)
+    text_width = text_bounds[2] - text_bounds[0]
+    text_height = text_bounds[3] - text_bounds[1]
+    draw.text(
+        (
+            (width - text_width) / 2 - text_bounds[0],
+            (height - text_height) / 2 - text_bounds[1]
+        ),
+        answer,
+        fill=(35, 48, 76),
+        font=font,
+        stroke_width=1,
+        stroke_fill=(35, 48, 76)
+    )
+
+    output = BytesIO()
+    image.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
+async def send_captcha_challenge(
+    interaction: discord.Interaction,
+    guild_id: int,
+    member_id: int
+) -> None:
+    key = (guild_id, member_id)
+    challenge = captcha_challenges.get(key)
+    is_new_challenge = False
+    if (
+        challenge is None
+        or challenge.get("expires_at", 0) <= time.time()
+    ):
+        is_new_challenge = True
+        answer = "".join(
+            secrets.choice(CAPTCHA_CHARACTERS)
+            for _ in range(CAPTCHA_LENGTH)
+        )
+        challenge_id = uuid.uuid4().hex
+        challenge = {
+            "id": challenge_id,
+            "answer": answer,
+            "attempts": 0,
+            "expires_at": time.time() + CAPTCHA_EXPIRY_SECONDS,
+        }
+        captcha_challenges[key] = challenge
+    else:
+        answer = challenge["answer"]
+        challenge_id = challenge["id"]
+
+    embed = discord.Embed(
+        title="Visual verification",
+        description=(
+            "Enter the 6-character code shown below. This challenge expires "
+            "in 5 minutes. If you have difficulty reading it, please contact "
+            "a moderator."
+        ),
+        colour=discord.Colour.blue()
+    )
+    embed.set_image(url="attachment://verification-captcha.png")
+
+    try:
+        image = create_captcha_image(answer)
+        await interaction.response.send_message(
+            embed=embed,
+            file=discord.File(image, filename="verification-captcha.png"),
+            view=CaptchaPromptView(guild_id, member_id, challenge_id),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except (discord.HTTPException, OSError) as error:
+        current_challenge = captcha_challenges.get(key)
+        if (
+            is_new_challenge
+            and current_challenge is not None
+            and current_challenge.get("id") == challenge_id
+        ):
+            captcha_challenges.pop(key, None)
+        print(
+            f"[VERIFICATION] Could not create or send a CAPTCHA for member "
+            f"{member_id} in guild {guild_id}: {error}"
+        )
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "I couldn't create the CAPTCHA. Please try again.",
+                ephemeral=True
+            )
+
+
 async def complete_verification(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    captcha_passed: bool = False
 ) -> None:
     guild = interaction.guild
     member = interaction.user
@@ -2460,6 +2741,13 @@ async def complete_verification(
         )
         return
 
+    if captcha_passed and config["type"] != "captcha":
+        await interaction.response.send_message(
+            "The verification setup has changed. Please start verification again.",
+            ephemeral=True
+        )
+        return
+
     role = guild.get_role(int(config["role_id"]))
     if role is None:
         print(
@@ -2488,6 +2776,14 @@ async def complete_verification(
         await interaction.response.send_message(
             "I can't assign the verified role. Please contact a server administrator.",
             ephemeral=True
+        )
+        return
+
+    if config["type"] == "captcha" and not captcha_passed:
+        await send_captcha_challenge(
+            interaction,
+            guild.id,
+            member.id
         )
         return
 
